@@ -4,6 +4,7 @@
 
 import { MCPTool, MCPToolCallResult } from '@janhq/core'
 import type { MCPServerConfig, MCPServers, MCPSettings } from '@/hooks/useMCPServers'
+import type { ElicitationAction } from '@/types/events'
 
 export interface MCPConfig {
   mcpServers?: MCPServers
@@ -35,4 +36,11 @@ export interface MCPService {
   activateMCPServer(name: string, config: MCPServerConfig): Promise<void>
   deactivateMCPServer(name: string): Promise<void>
   checkJanBrowserExtensionConnected(): Promise<boolean>
+
+  // MCP Elicitation support
+  respondToElicitation(
+    elicitationId: string,
+    action: ElicitationAction,
+    content?: Record<string, unknown>
+  ): Promise<void>
 }

@@ -1,10 +1,15 @@
 use rmcp::{
-    model::{ClientCapabilities, ClientInfo, Implementation},
+    handler::client::ClientHandler,
+    model::{
+        ClientCapabilities, ClientInfo, CreateElicitationRequestParam,
+        CreateElicitationResult, ElicitationAction, ElicitationCapability, Implementation,
+    },
+    service::RequestContext,
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, SseClientTransport,
         StreamableHttpClientTransport, TokioChildProcess,
     },
-    ServiceExt,
+    RoleClient, ServiceExt, ErrorData,
 };
 use serde_json::Value;
 use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
@@ -13,16 +18,175 @@ use tauri_plugin_http::reqwest;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     time::{sleep, timeout},
 };
 
 use crate::core::{
     app::commands::get_jan_data_folder_path,
-    mcp::models::{McpServerConfig, McpSettings},
+    mcp::models::{ElicitAction, ElicitRequest, McpServerConfig, McpSettings, PendingElicitation},
     state::{AppState, RunningServiceEnum, SharedMcpServers},
 };
 use jan_utils::{can_override_npx, can_override_uvx};
+
+/// Custom client handler for MCP with elicitation support
+/// 
+/// This struct holds the necessary state to handle elicitation requests
+/// from MCP servers and forward them to the frontend.
+/// Uses concrete AppHandle type (which is AppHandle<Wry> in Tauri 2.x)
+pub struct JanClientHandler {
+    /// The name of the MCP server this handler is connected to
+    pub server_name: String,
+    /// Pending elicitation requests storage (shared with AppState)
+    pub pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// App handle for emitting events to frontend
+    pub app_handle: tauri::AppHandle,
+}
+
+impl Clone for JanClientHandler {
+    fn clone(&self) -> Self {
+        Self {
+            server_name: self.server_name.clone(),
+            pending_elicitations: self.pending_elicitations.clone(),
+            app_handle: self.app_handle.clone(),
+        }
+    }
+}
+
+impl ClientHandler for JanClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo {
+            protocol_version: Default::default(),
+            capabilities: ClientCapabilities {
+                elicitation: Some(ElicitationCapability::default()),
+                ..Default::default()
+            },
+            client_info: Implementation {
+                name: "Jan Client".to_string(),
+                version: "0.0.1".to_string(),
+                title: None,
+                website_url: None,
+                icons: None,
+            },
+        }
+    }
+
+    async fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParam,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CreateElicitationResult, ErrorData> {
+        // Generate unique ID for this elicitation
+        let elicitation_id = uuid::Uuid::new_v4().to_string();
+        
+        log::info!(
+            "Received elicitation request {} from server {}: {}",
+            elicitation_id,
+            self.server_name,
+            request.message
+        );
+        
+        // Create response channel
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        // Create the pending elicitation
+        let pending_elicitation = PendingElicitation {
+            request: ElicitRequest {
+                id: elicitation_id.clone(),
+                server: self.server_name.clone(),
+                message: request.message.clone(),
+                requested_schema: serde_json::to_value(&request.requested_schema).unwrap_or_default(),
+            },
+            response_tx,
+        };
+        
+        // Store the pending elicitation
+        {
+            let mut pending = self.pending_elicitations.lock().await;
+            pending.insert(elicitation_id.clone(), pending_elicitation);
+        }
+        
+        // Emit event to frontend
+        let event_payload = serde_json::json!({
+            "id": elicitation_id,
+            "server": self.server_name,
+            "message": request.message,
+            "requestedSchema": request.requested_schema,
+        });
+        
+        if let Err(e) = self.app_handle.emit("mcp-elicitation", event_payload) {
+            log::error!("Failed to emit elicitation event: {e}");
+            // Clean up and return cancel
+            let mut pending = self.pending_elicitations.lock().await;
+            pending.remove(&elicitation_id);
+            return Ok(CreateElicitationResult {
+                action: ElicitationAction::Cancel,
+                content: None,
+            });
+        }
+        
+        log::info!("Emitted elicitation request {} to frontend", elicitation_id);
+        
+        // Wait for response with timeout
+        let timeout_duration = Duration::from_secs(300); // 5 minutes
+        match timeout(timeout_duration, response_rx).await {
+            Ok(Ok(response)) => {
+                log::info!("Elicitation {} responded with action: {:?}", elicitation_id, response.action);
+                Ok(CreateElicitationResult {
+                    action: match response.action {
+                        ElicitAction::Accept => ElicitationAction::Accept,
+                        ElicitAction::Decline => ElicitationAction::Decline,
+                        ElicitAction::Cancel => ElicitationAction::Cancel,
+                    },
+                    content: response.content,
+                })
+            }
+            Ok(Err(_)) => {
+                log::error!("Elicitation response channel closed unexpectedly");
+                let mut pending = self.pending_elicitations.lock().await;
+                pending.remove(&elicitation_id);
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Cancel,
+                    content: None,
+                })
+            }
+            Err(_) => {
+                log::warn!("Elicitation {} timed out after {:?}", elicitation_id, timeout_duration);
+                let mut pending = self.pending_elicitations.lock().await;
+                pending.remove(&elicitation_id);
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Cancel,
+                    content: None,
+                })
+            }
+        }
+    }
+}
+
+/// State container for restart loop operations
+pub struct RestartLoopState {
+    pub restart_counts: Arc<Mutex<HashMap<String, u32>>>,
+    pub successfully_connected: Arc<Mutex<HashMap<String, bool>>>,
+    pub mcp_settings: Arc<Mutex<McpSettings>>,
+}
+
+/// Calculate exponential backoff delay for restart attempts
+fn calculate_exponential_backoff_delay(restart_count: u32, settings: &McpSettings) -> u64 {
+    let base_delay = settings.base_restart_delay_ms;
+    let max_delay = settings.max_restart_delay_ms;
+    let multiplier = settings.backoff_multiplier;
+    
+    // Exponential backoff: base_delay * multiplier^(restart_count - 1)
+    let delay = if restart_count == 0 {
+        base_delay
+    } else {
+        let factor = multiplier.powi(restart_count as i32 - 1);
+        (base_delay as f64 * factor) as u64
+    };
+    
+    // Cap at max delay
+    delay.min(max_delay)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ShutdownContext {
@@ -219,6 +383,10 @@ pub async fn monitor_mcp_server_handle(
                         log::info!("Stopping server {name} with initialization...");
                         let _ = service.cancel().await;
                     }
+                    RunningServiceEnum::WithElicitation(service) => {
+                        log::info!("Stopping server {name} with elicitation handler...");
+                        let _ = service.cancel().await;
+                    }
                 }
             }
             return Some(rmcp::service::QuitReason::Closed);
@@ -262,6 +430,229 @@ pub async fn start_mcp_server<R: Runtime>(
     }
 }
 
+/// Helper function to handle the restart loop logic
+pub async fn start_restart_loop<R: Runtime>(
+    app: AppHandle<R>,
+    servers_state: SharedMcpServers,
+    name: String,
+    config: Value,
+    max_restarts: u32,
+    state: RestartLoopState,
+) {
+    loop {
+        let current_restart_count = {
+            let mut counts = state.restart_counts.lock().await;
+            let count = counts.entry(name.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+
+        if current_restart_count > max_restarts {
+            log::error!(
+                "MCP server {name} reached maximum restart attempts ({max_restarts}). Giving up."
+            );
+            if let Err(e) = app.emit(
+                "mcp_max_restarts_reached",
+                serde_json::json!({
+                    "server": name,
+                    "max_restarts": max_restarts
+                }),
+            ) {
+                log::error!("Failed to emit mcp_max_restarts_reached event: {e}");
+            }
+            break;
+        }
+
+        log::info!(
+            "Restarting MCP server {name} (Attempt {current_restart_count}/{max_restarts})"
+        );
+
+        // Calculate exponential backoff delay
+        let settings_snapshot = {
+            let settings_guard = state.mcp_settings.lock().await;
+            settings_guard.clone()
+        };
+        let delay_ms =
+            calculate_exponential_backoff_delay(current_restart_count, &settings_snapshot);
+        log::info!(
+            "Waiting {delay_ms}ms before restart attempt {current_restart_count} for MCP server {name}"
+        );
+        sleep(Duration::from_millis(delay_ms)).await;
+
+        // Attempt to restart the server
+        let start_result = schedule_mcp_start_task(
+            app.clone(),
+            servers_state.clone(),
+            name.clone(),
+            config.clone(),
+        )
+        .await;
+
+        match start_result {
+            Ok(_) => {
+                log::info!("MCP server {name} restarted successfully.");
+
+                // Check if server passed verification (was marked as successfully connected)
+                let passed_verification = {
+                    let connected = state.successfully_connected.lock().await;
+                    connected.get(&name).copied().unwrap_or(false)
+                };
+
+                if !passed_verification {
+                    log::error!(
+                        "MCP server {name} failed verification after restart - stopping permanently"
+                    );
+                    break;
+                }
+
+                // Reset restart count on successful restart with verification
+                {
+                    let mut counts = state.restart_counts.lock().await;
+                    if let Some(count) = counts.get_mut(&name) {
+                        if *count > 0 {
+                            log::info!(
+                                "MCP server {name} restarted successfully, resetting restart count from {count} to 0."
+                            );
+                            *count = 0;
+                        }
+                    }
+                }
+
+                // Monitor the server again (no shutdown flag needed in this context)
+                let quit_reason =
+                    monitor_mcp_server_handle(servers_state.clone(), name.clone(), Arc::new(Mutex::new(false))).await;
+
+                log::info!("MCP server {name} quit with reason: {quit_reason:?}");
+
+                // Check if server was marked as successfully connected
+                let was_connected = {
+                    let connected = state.successfully_connected.lock().await;
+                    connected.get(&name).copied().unwrap_or(false)
+                };
+
+                // Only continue restart loop if server was previously connected
+                if !was_connected {
+                    log::error!(
+                        "MCP server {name} failed before establishing successful connection - stopping permanently"
+                    );
+                    break;
+                }
+
+                // Determine if we should restart based on quit reason
+                let should_restart = match quit_reason {
+                    Some(reason) => {
+                        log::warn!("MCP server {name} terminated unexpectedly: {reason:?}");
+                        true
+                    }
+                    None => {
+                        log::info!("MCP server {name} was manually stopped - not restarting");
+                        false
+                    }
+                };
+
+                if !should_restart {
+                    break;
+                }
+                // Continue the loop for another restart attempt
+            }
+            Err(e) => {
+                log::error!("Failed to restart MCP server {name}: {e}");
+
+                // Check if server was marked as successfully connected before
+                let was_connected = {
+                    let connected = state.successfully_connected.lock().await;
+                    connected.get(&name).copied().unwrap_or(false)
+                };
+
+                // Only continue restart attempts if server was previously connected
+                if !was_connected {
+                    log::error!(
+                        "MCP server {name} failed restart and was never successfully connected - stopping permanently"
+                    );
+                    break;
+                }
+                // Continue the loop for another restart attempt
+            }
+        }
+    }
+}
+
+/// Start HTTP MCP server with elicitation support
+/// This is a specialized function that works with concrete AppHandle type
+async fn start_http_mcp_server(
+    app: tauri::AppHandle,
+    servers: SharedMcpServers,
+    name: String,
+    config_params: McpServerConfig,
+) -> Result<(), String> {
+    let transport = StreamableHttpClientTransport::with_client(
+        reqwest::Client::builder()
+            .default_headers({
+                let mut headers: tauri::http::HeaderMap = reqwest::header::HeaderMap::new();
+                for (key, value) in config_params.headers.iter() {
+                    if let Some(v_str) = value.as_str() {
+                        let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes());
+                        if let Ok(header_name) = header_name {
+                            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(v_str)
+                            {
+                                headers.insert(header_name, header_value);
+                            }
+                        }
+                    }
+                }
+                headers
+            })
+            .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
+            .build()
+            .unwrap(),
+        StreamableHttpClientTransportConfig {
+            uri: config_params.url.unwrap().into(),
+            ..Default::default()
+        },
+    );
+
+    // Get the pending elicitations from app state
+    let pending_elicitations = {
+        let app_state = app.state::<AppState>();
+        app_state.pending_elicitations.clone()
+    };
+
+    // Create custom handler with elicitation support
+    let handler = JanClientHandler {
+        server_name: name.clone(),
+        pending_elicitations,
+        app_handle: app.clone(),
+    };
+
+    let client = handler.serve(transport).await.inspect_err(|e| {
+        log::error!("client error: {e:?}");
+    });
+
+    match client {
+        Ok(client) => {
+            log::info!("Connected to server: {:?}", client.peer_info());
+            servers
+                .lock()
+                .await
+                .insert(name.clone(), RunningServiceEnum::WithElicitation(client));
+
+            // Mark server as successfully connected (for restart policy)
+            {
+                let app_state = app.state::<AppState>();
+                let mut connected = app_state.mcp_successfully_connected.lock().await;
+                connected.insert(name.clone(), true);
+                log::info!("Marked MCP server {name} as successfully connected");
+            }
+            emit_mcp_update_event(&app, &name);
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("Failed to connect to server: {e}");
+            Err(format!("Failed to connect to server: {e}"))
+        }
+    }
+}
+
 async fn schedule_mcp_start_task<R: Runtime>(
     app: tauri::AppHandle<R>,
     servers: SharedMcpServers,
@@ -279,67 +670,11 @@ async fn schedule_mcp_start_task<R: Runtime>(
         .ok_or_else(|| format!("Failed to extract command args from config for {name}"))?;
 
     if config_params.transport_type.as_deref() == Some("http") && config_params.url.is_some() {
-        let transport = StreamableHttpClientTransport::with_client(
-            reqwest::Client::builder()
-                .default_headers({
-                    // Map envs to request headers
-                    let mut headers: tauri::http::HeaderMap = reqwest::header::HeaderMap::new();
-                    for (key, value) in config_params.headers.iter() {
-                        if let Some(v_str) = value.as_str() {
-                            // Try to map env keys to HTTP header names (case-insensitive)
-                            // Most HTTP headers are Title-Case, so we try to convert
-                            let header_name =
-                                reqwest::header::HeaderName::from_bytes(key.as_bytes());
-                            if let Ok(header_name) = header_name {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(v_str)
-                                {
-                                    headers.insert(header_name, header_value);
-                                }
-                            }
-                        }
-                    }
-                    headers
-                })
-                .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
-                .build()
-                .unwrap(),
-            StreamableHttpClientTransportConfig {
-                uri: config_params.url.unwrap().into(),
-                ..Default::default()
-            },
-        );
-
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "Jan Streamable Client".to_string(),
-                version: "0.0.1".to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-        };
-        let client = client_info.serve(transport).await.inspect_err(|e| {
-            log::error!("client error: {e:?}");
-        });
-
-        match client {
-            Ok(client) => {
-                log::info!("Connected to server: {:?}", client.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::WithInit(client));
-
-                emit_mcp_update_event(&app, &name);
-            }
-            Err(e) => {
-                log::error!("Failed to connect to server: {e}");
-                return Err(format!("Failed to connect to server: {e}"));
-            }
-        }
+        // For HTTP transport with elicitation support, we need the concrete AppHandle type
+        // The generic R is always Wry at runtime, so we can safely convert
+        let app_handle: tauri::AppHandle = unsafe { std::mem::transmute_copy(&app) };
+        
+        return start_http_mcp_server(app_handle, servers, name, config_params).await;
     } else if config_params.transport_type.as_deref() == Some("sse") && config_params.url.is_some()
     {
         let transport = SseClientTransport::start_with_client(
@@ -895,6 +1230,7 @@ pub async fn stop_mcp_servers_with_context<R: Runtime>(
                     match service {
                         RunningServiceEnum::NoInit(service) => service.cancel().await,
                         RunningServiceEnum::WithInit(service) => service.cancel().await,
+                        RunningServiceEnum::WithElicitation(service) => service.cancel().await,
                     }
                 };
 

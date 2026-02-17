@@ -25,6 +25,7 @@ export const AppRoutes = [
   'getConnectedServers',
   'readLogs',
   'changeAppDataFolder',
+  'respondToElicitation',
 ]
 // Define API routes based on different route types
 export const Routes = [...CoreRoutes, ...APIRoutes, ...AppRoutes].map((r) => ({

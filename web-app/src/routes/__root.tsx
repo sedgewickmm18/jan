@@ -18,6 +18,7 @@ import { PromptJanModel } from '@/containers/PromptJanModel'
 import { AnalyticProvider } from '@/providers/AnalyticProvider'
 import { useLeftPanel } from '@/hooks/useLeftPanel'
 import ToolApproval from '@/containers/dialogs/ToolApproval'
+import ElicitationDialog from '@/containers/dialogs/ElicitationDialog'
 import { TranslationProvider } from '@/i18n/TranslationContext'
 import OutOfContextPromiseModal from '@/containers/dialogs/OutOfContextDialog'
 import AttachmentIngestionDialog from '@/containers/dialogs/AttachmentIngestionDialog'
@@ -140,6 +141,7 @@ function RootLayout() {
           {/* <TanStackRouterDevtools position="bottom-right" /> */}
           <ToolApproval />
           <AttachmentIngestionDialog />
+          <ElicitationDialog />
           <OutOfContextPromiseModal />
         </TranslationProvider>
       </ServiceHubProvider>

@@ -1,12 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::core::{downloads::models::DownloadManagerState, mcp::models::McpSettings};
+use crate::core::{downloads::models::DownloadManagerState, mcp::models::{McpSettings, PendingElicitation}};
 use rmcp::{
     model::{CallToolRequestParam, CallToolResult, InitializeRequestParam, Tool},
     service::RunningService,
     RoleClient, ServiceError,
 };
 use tokio::sync::{oneshot, Mutex};
+
+use super::mcp::helpers::JanClientHandler;
 
 /// Server handle type for managing the proxy server lifecycle
 pub type ServerHandle =
@@ -28,9 +30,14 @@ pub struct ProviderCustomHeader {
     pub value: String,
 }
 
+/// Type alias for the elicitation running service
+pub type ElicitationService = RunningService<RoleClient, JanClientHandler>;
+
 pub enum RunningServiceEnum {
     NoInit(RunningService<RoleClient, ()>),
     WithInit(RunningService<RoleClient, InitializeRequestParam>),
+    /// HTTP client with custom elicitation handler
+    WithElicitation(ElicitationService),
 }
 pub type SharedMcpServers = Arc<Mutex<HashMap<String, RunningServiceEnum>>>;
 
@@ -49,6 +56,10 @@ pub struct AppState {
     pub mcp_server_pids: Arc<Mutex<HashMap<String, u32>>>,
     /// Remote provider configurations (e.g., Anthropic, OpenAI, etc.)
     pub provider_configs: Arc<Mutex<HashMap<String, ProviderConfig>>>,
+    /// Pending elicitation requests waiting for user response
+    pub pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// Track which MCP servers have successfully connected (for restart policy)
+    pub mcp_successfully_connected: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl RunningServiceEnum {
@@ -56,6 +67,7 @@ impl RunningServiceEnum {
         match self {
             Self::NoInit(s) => s.list_all_tools().await,
             Self::WithInit(s) => s.list_all_tools().await,
+            Self::WithElicitation(s) => s.list_all_tools().await,
         }
     }
     pub async fn call_tool(
@@ -65,6 +77,7 @@ impl RunningServiceEnum {
         match self {
             Self::NoInit(s) => s.call_tool(params).await,
             Self::WithInit(s) => s.call_tool(params).await,
+            Self::WithElicitation(s) => s.call_tool(params).await,
         }
     }
 }

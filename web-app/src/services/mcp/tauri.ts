@@ -8,6 +8,7 @@ import { DEFAULT_MCP_SETTINGS } from '@/hooks/useMCPServers'
 import type { MCPServerConfig, MCPServers, MCPSettings } from '@/hooks/useMCPServers'
 import type { MCPConfig } from './types'
 import { DefaultMCPService } from './default'
+import type { ElicitationAction } from '@/types/events'
 
 export class TauriMCPService extends DefaultMCPService {
   async updateMCPConfig(configs: string): Promise<void> {
@@ -112,8 +113,21 @@ export class TauriMCPService extends DefaultMCPService {
     return await invoke('deactivate_mcp_server', { name })
   }
 
+
   async checkJanBrowserExtensionConnected(): Promise<boolean> {
     return await invoke('check_jan_browser_extension_connected')
+  }
+
+  async respondToElicitation(
+    elicitationId: string,
+    action: ElicitationAction,
+    content?: Record<string, unknown>
+  ): Promise<void> {
+    return await invoke('respond_to_elicitation', {
+      elicitationId,
+      action,
+      content
+    })
   }
 }
 

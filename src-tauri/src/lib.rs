@@ -110,6 +110,7 @@ pub fn run() {
         core::mcp::commands::activate_mcp_server,
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
+        core::mcp::commands::respond_to_elicitation,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -190,6 +191,7 @@ pub fn run() {
         core::mcp::commands::activate_mcp_server,
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
+        core::mcp::commands::respond_to_elicitation,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -221,6 +223,8 @@ pub fn run() {
             background_cleanup_handle: Arc::new(Mutex::new(None)),
             mcp_server_pids: Arc::new(Mutex::new(HashMap::new())),
             provider_configs: Arc::new(Mutex::new(HashMap::new())),
+            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_successfully_connected: Arc::new(Mutex::new(HashMap::new())),
         })
         .setup(|app| {
             app.handle().plugin(

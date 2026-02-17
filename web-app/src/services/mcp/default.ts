@@ -5,6 +5,7 @@
 import { MCPTool, MCPToolCallResult } from '@janhq/core'
 import type { MCPServerConfig } from '@/hooks/useMCPServers'
 import type { MCPService, MCPConfig, ToolCallWithCancellationResult } from './types'
+import type { ElicitationAction } from '@/types/events'
 
 export class DefaultMCPService implements MCPService {
   async updateMCPConfig(configs: string): Promise<void> {
@@ -67,7 +68,17 @@ export class DefaultMCPService implements MCPService {
     // No-op - not implemented in default service
   }
 
+
   async checkJanBrowserExtensionConnected(): Promise<boolean> {
     return false
+  }
+
+  async respondToElicitation(
+    elicitationId: string,
+    action: ElicitationAction,
+    content?: Record<string, unknown>
+  ): Promise<void> {
+    console.log('respondToElicitation called:', { elicitationId, action, content })
+    // No-op - not implemented in default service
   }
 }

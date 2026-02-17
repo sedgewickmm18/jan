@@ -2,6 +2,49 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::oneshot;
+
+/// Elicitation request from an MCP server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitRequest {
+    /// Unique ID for this elicitation request
+    pub id: String,
+    /// The server name that initiated the request
+    pub server: String,
+    /// The message to display to the user
+    pub message: String,
+    /// The JSON schema describing the expected response
+    pub requested_schema: Value,
+}
+
+/// Response to an elicitation request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitResponse {
+    /// The action taken by the user
+    pub action: ElicitAction,
+    /// The content submitted by the user (only present when action is "accept")
+    pub content: Option<Value>,
+}
+
+/// User action in response to elicitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitAction {
+    /// User submitted the form/confirmed the action
+    Accept,
+    /// User explicitly declined the action
+    Decline,
+    /// User dismissed without making an explicit choice
+    Cancel,
+}
+
+/// Pending elicitation request with response channel
+pub struct PendingElicitation {
+    pub request: ElicitRequest,
+    pub response_tx: oneshot::Sender<ElicitResponse>,
+}
 
 /// Configuration parameters extracted from MCP server config
 #[derive(Debug, Clone)]

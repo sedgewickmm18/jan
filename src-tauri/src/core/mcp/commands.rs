@@ -3,10 +3,12 @@ use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 use super::{
     constants::DEFAULT_MCP_CONFIG,
-    helpers::{restart_active_mcp_servers, start_mcp_server},
+    helpers::{restart_active_mcp_servers, start_mcp_server, stop_mcp_servers_with_context, ShutdownContext},
+    models::{ElicitAction, ElicitRequest, ElicitResponse, PendingElicitation},
 };
 use crate::core::{
     app::commands::get_jan_data_folder_path, mcp::models::McpSettings, state::AppState,
@@ -82,6 +84,10 @@ pub async fn deactivate_mcp_server<R: Runtime>(
         }
         RunningServiceEnum::WithInit(service) => {
             log::info!("Stopping server {name} with initialization...");
+            service.cancel().await.map_err(|e| e.to_string())?;
+        }
+        RunningServiceEnum::WithElicitation(service) => {
+            log::info!("Stopping server {name} with elicitation handler...");
             service.cancel().await.map_err(|e| e.to_string())?;
         }
     }
@@ -605,3 +611,109 @@ pub async fn save_mcp_configs<R: Runtime>(
 
     Ok(())
 }
+
+/// Response to an elicitation request from an MCP server
+/// 
+/// This command is called from the frontend after the user responds to an elicitation dialog.
+/// 
+/// # Arguments
+/// * `state` - Application state containing pending elicitations
+/// * `elicitation_id` - The ID of the elicitation request being responded to
+/// * `action` - The user's action: "accept", "decline", or "cancel"
+/// * `content` - The form data submitted by the user (only for "accept" action)
+#[tauri::command]
+pub async fn respond_to_elicitation(
+    state: State<'_, AppState>,
+    elicitation_id: String,
+    action: String,
+    content: Option<Value>,
+) -> Result<(), String> {
+    let mut pending = state.pending_elicitations.lock().await;
+    
+    if let Some(pending_elicitation) = pending.remove(&elicitation_id) {
+        let elicitation_action = match action.as_str() {
+            "accept" => ElicitAction::Accept,
+            "decline" => ElicitAction::Decline,
+            "cancel" => ElicitAction::Cancel,
+            _ => return Err(format!("Invalid elicitation action: {action}")),
+        };
+        
+        let response = ElicitResponse {
+            action: elicitation_action,
+            content,
+        };
+        
+        // Send the response back to the waiting handler
+        pending_elicitation.response_tx.send(response)
+            .map_err(|_| "Failed to send elicitation response - receiver dropped".to_string())?;
+        
+        log::info!("Elicitation {elicitation_id} responded with action: {action}");
+        Ok(())
+    } else {
+        Err(format!("Elicitation request {elicitation_id} not found or already responded"))
+    }
+}
+
+/// Handle an incoming elicitation request from an MCP server
+/// 
+/// This function is called by the elicitation handler when an MCP server requests user input.
+/// It stores the pending request and emits an event to the frontend to show a dialog.
+pub async fn handle_elicitation_request<R: Runtime>(
+    app: AppHandle<R>,
+    state: &State<'_, AppState>,
+    server_name: String,
+    message: String,
+    requested_schema: Value,
+) -> Result<ElicitResponse, String> {
+    let elicitation_id = Uuid::new_v4().to_string();
+    
+    // Create response channel
+    let (response_tx, response_rx) = oneshot::channel();
+    
+    // Create the pending elicitation
+    let pending_elicitation = PendingElicitation {
+        request: ElicitRequest {
+            id: elicitation_id.clone(),
+            server: server_name.clone(),
+            message: message.clone(),
+            requested_schema: requested_schema.clone(),
+        },
+        response_tx,
+    };
+    
+    // Store the pending elicitation
+    {
+        let mut pending = state.pending_elicitations.lock().await;
+        pending.insert(elicitation_id.clone(), pending_elicitation);
+    }
+    
+    // Emit event to frontend
+    let event_payload = json!({
+        "id": elicitation_id,
+        "server": server_name,
+        "message": message,
+        "requestedSchema": requested_schema,
+    });
+    
+    app.emit("mcp-elicitation", event_payload)
+        .map_err(|e| format!("Failed to emit elicitation event: {e}"))?;
+    
+    log::info!("Emitted elicitation request {elicitation_id} from server {server_name}");
+    
+    // Wait for response with a timeout
+    let timeout_duration = Duration::from_secs(300); // 5 minute timeout
+    match timeout(timeout_duration, response_rx).await {
+        Ok(result) => result.map_err(|_| "Elicitation response channel closed unexpectedly".to_string()),
+        Err(_) => {
+            // Timeout - clean up and return cancel
+            let mut pending = state.pending_elicitations.lock().await;
+            pending.remove(&elicitation_id);
+            log::warn!("Elicitation {elicitation_id} timed out after {timeout_duration:?}");
+            Ok(ElicitResponse {
+                action: ElicitAction::Cancel,
+                content: None,
+            })
+        }
+    }
+}
+
