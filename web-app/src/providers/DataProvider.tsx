@@ -26,16 +26,22 @@ type RegisterProviderRequest = {
   base_url?: string
   custom_headers: ProviderCustomHeader[]
   models: string[]
+  active: boolean
 }
 
 async function registerRemoteProvider(provider: ModelProvider) {
   // Skip llamacpp - those are local models
   if (provider.provider === 'llamacpp') return
 
-  // Skip providers without API key (they can't make requests)
-  if (!provider.api_key) {
-    console.log(`Provider ${provider.provider} has no API key, skipping registration`)
+  // Skip providers without base_url (they can't make requests)
+  if (!provider.base_url) {
+    console.log(`Provider ${provider.provider} has no base_url, skipping registration`)
     return
+  }
+
+  // Log inactive providers being registered with active=false
+  if (!provider.active) {
+    console.log(`Registering inactive provider ${provider.provider} with active=false`)
   }
 
   const request: RegisterProviderRequest = {
@@ -46,12 +52,13 @@ async function registerRemoteProvider(provider: ModelProvider) {
       header: h.header,
       value: h.value,
     })),
-    models: provider.models.map(e => e.id)
+    models: provider.models.map(e => e.id),
+    active: provider.active
   }
 
   try {
     await invoke('register_provider_config', { request })
-    console.log(`Registered remote provider: ${provider.provider}`)
+    console.log(`Registered remote provider: ${provider.provider} with ${provider.models.length} models`)
   } catch (error) {
     console.error(`Failed to register provider ${provider.provider}:`, error)
   }
@@ -61,7 +68,8 @@ async function registerRemoteProvider(provider: ModelProvider) {
 const syncRemoteProviders = () => {
   const providers = useModelProvider.getState().providers
   providers.forEach((provider) => {
-    if (provider.active && provider.provider !== 'llamacpp' && provider.api_key) {
+    // Register all providers (including inactive ones) so backend has correct active state
+    if (provider.provider !== 'llamacpp' && provider.base_url) {
       registerRemoteProvider(provider)
     }
   })

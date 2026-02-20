@@ -18,6 +18,7 @@ pub struct RegisterProviderRequest {
     pub base_url: Option<String>,
     pub custom_headers: Vec<ProviderCustomHeader>,
     pub models: Vec<String>,
+    pub active: bool,
 }
 
 /// Register a remote provider configuration
@@ -26,6 +27,14 @@ pub async fn register_provider_config(
     state: State<'_, AppState>,
     request: RegisterProviderRequest,
 ) -> Result<(), String> {
+    log::info!(
+        "register_provider_config called: provider={}, active={}, models={:?}, base_url={:?}",
+        request.provider,
+        request.active,
+        request.models,
+        request.base_url
+    );
+
     let provider_configs = state.provider_configs.clone();
     let mut configs = provider_configs.lock().await;
 
@@ -41,12 +50,17 @@ pub async fn register_provider_config(
                 value: h.value,
             })
             .collect(),
-        models: request.models, // Models will be added when they are configured
+        models: request.models,
+        active: request.active,
     };
 
     let provider_name = request.provider.clone();
+    let is_active = config.active;
     configs.insert(provider_name.clone(), config);
-    log::info!("Registered provider config: {provider_name}");
+    log::info!(
+        "Registered provider config: {provider_name} (active={is_active}, total providers={})",
+        configs.len()
+    );
     Ok(())
 }
 

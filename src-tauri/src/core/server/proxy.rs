@@ -728,19 +728,24 @@ async fn proxy_request<R: tauri::Runtime>(
                         let state = app_handle.state::<AppState>();
                         let provider_configs = state.provider_configs.lock().await;
 
-                        // Try to find a provider for this model
+                        // Try to find an ACTIVE provider for this model
                         provider_name = provider_configs
                             .iter()
-                            .find(|(_, config)| config.models.iter().any(|m| m == model_id))
+                            .find(|(_, config)| config.active && config.models.iter().any(|m| m == model_id))
                             .map(|(_, config)| config.provider.clone())
                             .or_else(|| {
                                 if let Some(sep_pos) = model_id.find('/') {
                                     let potential_provider: &str = &model_id[..sep_pos];
-                                    if provider_configs.contains_key(potential_provider) {
-                                        return Some(potential_provider.to_string());
+                                    if let Some(cfg) = provider_configs.get(potential_provider) {
+                                        if cfg.active {
+                                            return Some(potential_provider.to_string());
+                                        }
                                     }
                                 }
-                                provider_configs.get(model_id).map(|c| c.provider.clone())
+                                // Also check if model_id matches a provider name and is active
+                                provider_configs.get(model_id)
+                                    .filter(|c| c.active)
+                                    .map(|c| c.provider.clone())
                             });
 
                         drop(provider_configs);
@@ -862,24 +867,28 @@ async fn proxy_request<R: tauri::Runtime>(
                         let state = app_handle.state::<AppState>();
                         let provider_configs = state.provider_configs.lock().await;
 
-                        // Try to find a provider that has this model configured
+                        // Try to find an ACTIVE provider that has this model configured
                         let provider_name = provider_configs
                             .iter()
                             .find(|(_, config)| {
-                                // Check if any model in this provider matches
-                                config.models.iter().any(|m| m == model_id)
+                                // Check if provider is active and has this model
+                                config.active && config.models.iter().any(|m| m == model_id)
                             })
                             .map(|(_, config)| config.provider.clone())
                             .or_else(|| {
                                 // Try to find by provider name in model_id (e.g., "anthropic/claude-3-opus")
                                 if let Some(sep_pos) = model_id.find('/') {
                                     let potential_provider: &str = &model_id[..sep_pos];
-                                    if provider_configs.contains_key(potential_provider) {
-                                        return Some(potential_provider.to_string());
+                                    if let Some(cfg) = provider_configs.get(potential_provider) {
+                                        if cfg.active {
+                                            return Some(potential_provider.to_string());
+                                        }
                                     }
                                 }
-                                // Also check if the model_id itself matches a provider name
-                                provider_configs.get(model_id).map(|c| c.provider.clone())
+                                // Also check if the model_id itself matches a provider name and is active
+                                provider_configs.get(model_id)
+                                    .filter(|c| c.active)
+                                    .map(|c| c.provider.clone())
                             });
 
                         drop(provider_configs);
@@ -1059,21 +1068,64 @@ async fn proxy_request<R: tauri::Runtime>(
                     .collect()
             };
 
-            // Get remote provider models
+            // Get remote provider models by querying each provider's /models endpoint
             let state = app_handle.state::<AppState>();
             let provider_configs = state.provider_configs.lock().await;
-            let remote_models: Vec<_> = provider_configs
+            
+            // Collect active provider info for async queries (skip inactive providers)
+            let providers_to_query: Vec<(String, Option<String>, Option<String>)> = provider_configs
                 .values()
-                .flat_map(|provider_cfg| provider_cfg.models.clone())
-                .map(|model_id| {
-                    serde_json::json!({
-                        "id": model_id,
-                        "object": "model",
-                        "created": 1,
-                        "owned_by": "remote"
-                    })
-                })
+                .filter(|cfg| cfg.active) // Only include active providers
+                .map(|cfg| (cfg.provider.clone(), cfg.base_url.clone(), cfg.api_key.clone()))
                 .collect();
+            drop(provider_configs);
+
+            // Query each remote provider for available models
+            let mut remote_models = Vec::new();
+            for (provider_name, base_url, api_key) in providers_to_query {
+                if let Some(url) = base_url {
+                    let models_url = format!("{}{}", url.trim_end_matches('/'), "/models");
+                    log::debug!("Querying remote provider '{}' for models: {}", provider_name, models_url);
+                    
+                    let mut req = client.get(&models_url).timeout(std::time::Duration::from_secs(5));
+                    
+                    if let Some(key) = &api_key {
+                        req = req.header("Authorization", format!("Bearer {}", key));
+                    }
+                    
+                    match req.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(json) => {
+                                    // Parse OpenAI-style models response
+                                    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                                        for model in data {
+                                            if let Some(model_id) = model.get("id").and_then(|id| id.as_str()) {
+                                                remote_models.push(serde_json::json!({
+                                                    "id": model_id,
+                                                    "object": "model",
+                                                    "created": 1,
+                                                    "owned_by": provider_name
+                                                }));
+                                            }
+                                        }
+                                        log::debug!("Provider '{}' returned {} models", provider_name, data.len());
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to parse models response from '{}': {}", provider_name, e);
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            log::warn!("Provider '{}' returned status {} for /models", provider_name, resp.status());
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to query provider '{}' for models: {}", provider_name, e);
+                        }
+                    }
+                }
+            }
 
             // Store counts before moving
             let local_count = local_models.len();

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::core::{downloads::models::DownloadManagerState, mcp::models::{McpSettings, PendingElicitation}};
+use crate::core::{downloads::models::DownloadManagerState, mcp::models::{McpSettings, PendingElicitation, PendingSampling}};
 use rmcp::{
     model::{CallToolRequestParam, CallToolResult, InitializeRequestParam, Tool},
     service::RunningService,
@@ -22,6 +22,9 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub custom_headers: Vec<ProviderCustomHeader>,
     pub models: Vec<String>,
+    /// Whether this provider is active/enabled
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -58,8 +61,14 @@ pub struct AppState {
     pub provider_configs: Arc<Mutex<HashMap<String, ProviderConfig>>>,
     /// Pending elicitation requests waiting for user response
     pub pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// Pending sampling requests waiting for LLM response
+    pub pending_samplings: Arc<Mutex<HashMap<String, PendingSampling>>>,
     /// Track which MCP servers have successfully connected (for restart policy)
     pub mcp_successfully_connected: Arc<Mutex<HashMap<String, bool>>>,
+    /// The port the proxy server is running on (set by start_server command)
+    pub proxy_port: Arc<Mutex<Option<u16>>>,
+    /// The currently active model ID for sampling requests
+    pub active_model: Arc<Mutex<Option<String>>>,
 }
 
 impl RunningServiceEnum {

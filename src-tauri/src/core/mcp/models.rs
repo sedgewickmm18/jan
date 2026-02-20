@@ -46,6 +46,133 @@ pub struct PendingElicitation {
     pub response_tx: oneshot::Sender<ElicitResponse>,
 }
 
+// ============================================================================
+// MCP Sampling Support
+// ============================================================================
+
+/// Sampling request from an MCP server (createMessage)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingRequest {
+    /// Unique ID for this sampling request
+    pub id: String,
+    /// The server name that initiated the request
+    pub server: String,
+    /// Messages in the conversation
+    pub messages: Vec<SamplingMessage>,
+    /// System prompt to use (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Maximum tokens to generate
+    pub max_tokens: u32,
+    /// Temperature for sampling (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Stop sequences (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Model preferences (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_preferences: Option<ModelPreferences>,
+    /// Include context setting (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_context: Option<String>,
+    /// Additional metadata (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+/// A message in a sampling conversation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingMessage {
+    /// The role of the message sender
+    pub role: String,
+    /// The content of the message
+    pub content: SamplingContent,
+}
+
+/// Content of a sampling message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SamplingContent {
+    Text { text: String },
+    Image { data: String, mime_type: String },
+    Resource { resource: ResourceContent },
+}
+
+/// Resource content for sampling messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceContent {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Model preferences for sampling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPreferences {
+    /// Hints for model selection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<ModelHint>>,
+    /// Priority for cost efficiency (0.0 - 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_priority: Option<f64>,
+    /// Priority for speed (0.0 - 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_priority: Option<f64>,
+    /// Priority for intelligence (0.0 - 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intelligence_priority: Option<f64>,
+}
+
+/// A hint for model selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Response to a sampling request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingResponse {
+    /// The generated message
+    pub message: SamplingMessage,
+    /// The model that was used
+    pub model: String,
+    /// Reason for stopping
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+/// User action in response to sampling request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SamplingAction {
+    /// User accepted/provided a response
+    Accept,
+    /// User declined to generate
+    Decline,
+    /// User cancelled the request
+    Cancel,
+}
+
+/// Pending sampling request with response channel
+pub struct PendingSampling {
+    pub request: SamplingRequest,
+    pub response_tx: oneshot::Sender<Result<SamplingResponse, SamplingAction>>,
+}
+
+// ============================================================================
+// MCP Server Configuration
+// ============================================================================
+
 /// Configuration parameters extracted from MCP server config
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {

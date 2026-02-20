@@ -3,13 +3,15 @@ use rmcp::{
     model::{
         ClientCapabilities, ClientInfo, CreateElicitationRequestParam,
         CreateElicitationResult, ElicitationAction, ElicitationCapability, Implementation,
+        CreateMessageRequestParam, CreateMessageResult,
+        Role, Content, ErrorData,
     },
     service::RequestContext,
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, SseClientTransport,
         StreamableHttpClientTransport, TokioChildProcess,
     },
-    RoleClient, ServiceExt, ErrorData,
+    RoleClient, ServiceExt,
 };
 use serde_json::Value;
 use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
@@ -24,14 +26,14 @@ use tokio::{
 
 use crate::core::{
     app::commands::get_jan_data_folder_path,
-    mcp::models::{ElicitAction, ElicitRequest, McpServerConfig, McpSettings, PendingElicitation},
+    mcp::models::{ElicitAction, ElicitRequest, McpServerConfig, McpSettings, PendingElicitation, PendingSampling},
     state::{AppState, RunningServiceEnum, SharedMcpServers},
 };
 use jan_utils::{can_override_npx, can_override_uvx};
 
-/// Custom client handler for MCP with elicitation support
+/// Custom client handler for MCP with elicitation and sampling support
 /// 
-/// This struct holds the necessary state to handle elicitation requests
+/// This struct holds the necessary state to handle elicitation and sampling requests
 /// from MCP servers and forward them to the frontend.
 /// Uses concrete AppHandle type (which is AppHandle<Wry> in Tauri 2.x)
 pub struct JanClientHandler {
@@ -39,6 +41,8 @@ pub struct JanClientHandler {
     pub server_name: String,
     /// Pending elicitation requests storage (shared with AppState)
     pub pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// Pending sampling requests storage (shared with AppState)
+    pub pending_samplings: Arc<Mutex<HashMap<String, PendingSampling>>>,
     /// App handle for emitting events to frontend
     pub app_handle: tauri::AppHandle,
 }
@@ -48,6 +52,7 @@ impl Clone for JanClientHandler {
         Self {
             server_name: self.server_name.clone(),
             pending_elicitations: self.pending_elicitations.clone(),
+            pending_samplings: self.pending_samplings.clone(),
             app_handle: self.app_handle.clone(),
         }
     }
@@ -59,6 +64,8 @@ impl ClientHandler for JanClientHandler {
             protocol_version: Default::default(),
             capabilities: ClientCapabilities {
                 elicitation: Some(ElicitationCapability::default()),
+                // Enable sampling capability
+                sampling: Some(serde_json::Map::new()),
                 ..Default::default()
             },
             client_info: Implementation {
@@ -160,6 +167,21 @@ impl ClientHandler for JanClientHandler {
                 })
             }
         }
+    }
+
+    async fn create_message(
+        &self,
+        request: CreateMessageRequestParam,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CreateMessageResult, ErrorData> {
+        log::info!(
+            "Received sampling request from server {} with {} messages",
+            self.server_name,
+            request.messages.len()
+        );
+        
+        // Call the LLM directly via Jan's proxy server
+        call_llm_for_sampling(&self.app_handle, request).await
     }
 }
 
@@ -611,16 +633,17 @@ async fn start_http_mcp_server(
         },
     );
 
-    // Get the pending elicitations from app state
-    let pending_elicitations = {
+    // Get the pending elicitations and samplings from app state
+    let (pending_elicitations, pending_samplings) = {
         let app_state = app.state::<AppState>();
-        app_state.pending_elicitations.clone()
+        (app_state.pending_elicitations.clone(), app_state.pending_samplings.clone())
     };
 
-    // Create custom handler with elicitation support
+    // Create custom handler with elicitation and sampling support
     let handler = JanClientHandler {
         server_name: name.clone(),
         pending_elicitations,
+        pending_samplings,
         app_handle: app.clone(),
     };
 
@@ -1354,4 +1377,388 @@ pub fn add_server_config_with_path<R: Runtime>(
     .map_err(|e| format!("Failed to write config file: {e}"))?;
 
     Ok(())
+}
+
+/// Call the LLM for MCP sampling requests
+/// 
+/// This function uses the proxy server if running, otherwise directly accesses the LLM backend.
+async fn call_llm_for_sampling(
+    app_handle: &tauri::AppHandle,
+    request: CreateMessageRequestParam,
+) -> Result<CreateMessageResult, ErrorData> {
+    use tauri_plugin_llamacpp::state::LlamacppState;
+    use tauri_plugin_mlx::state::MlxState;
+    
+    // Check if proxy server is running
+    let proxy_port = {
+        let app_state = app_handle.state::<AppState>();
+        let port = *app_state.proxy_port.lock().await;
+        port
+    };
+    
+    // Try to get the active model from app state, or find any running session or remote provider
+    let model = {
+        let app_state = app_handle.state::<AppState>();
+        let active = app_state.active_model.lock().await.clone();
+        
+        match active {
+            Some(m) => Some(m),
+            None => {
+                // No active model set, try to find any running session or remote provider
+                log::debug!("No active model set, searching for available models...");
+                
+                // Check llama.cpp sessions first
+                let llama_state: tauri::State<LlamacppState> = app_handle.state();
+                let llama_sessions = llama_state.llama_server_process.lock().await;
+                if let Some(session) = llama_sessions.values().next() {
+                    log::info!("Found running llama.cpp session: {}", session.info.model_id);
+                    Some(session.info.model_id.clone())
+                } else {
+                    drop(llama_sessions);
+                    
+                    // Check MLX sessions
+                    let mlx_state: tauri::State<MlxState> = app_handle.state();
+                    let mlx_sessions = mlx_state.mlx_server_process.lock().await;
+                    if let Some(session) = mlx_sessions.values().next() {
+                        log::info!("Found running MLX session: {}", session.info.model_id);
+                        Some(session.info.model_id.clone())
+                    } else {
+                        drop(mlx_sessions);
+                        
+                        // Check remote providers - use the first available model from any ACTIVE provider
+                        let provider_configs = app_state.provider_configs.lock().await;
+                        // Find first active provider with models
+                        let active_provider = provider_configs.iter()
+                            .find(|(_, config)| config.active && !config.models.is_empty());
+                        
+                        if let Some((provider_name, config)) = active_provider {
+                            if let Some(first_model) = config.models.first() {
+                                log::info!("Found active remote provider '{}' with model: {}", provider_name, first_model);
+                                Some(first_model.clone())
+                            } else {
+                                log::debug!("Active remote provider '{}' has no models configured", provider_name);
+                                None
+                            }
+                        } else {
+                            log::debug!("No active remote providers with models found");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    };
+    
+    // Get model or return error
+    let model = match model {
+        Some(m) => m,
+        None => {
+            log::error!("No active model, no running sessions, and no remote providers found for MCP sampling");
+            return Err(ErrorData::internal_error(
+                "No model available for sampling. Please configure a model provider or start a local model in Jan first.",
+                None,
+            ));
+        }
+    };
+    
+    log::info!("Calling LLM {model} for MCP sampling with max_tokens={}", request.max_tokens);
+    
+    // Log the incoming MCP sampling request parameters
+    log::debug!(
+        "MCP sampling request: model_preference={:?}, temperature={:?}, stop_sequences={:?}, system_prompt={:?}",
+        request.model_preferences,
+        request.temperature,
+        request.stop_sequences,
+        request.system_prompt
+    );
+    
+    // Build the request body (Anthropic format)
+    let messages: Vec<Value> = request.messages.iter().map(|msg| {
+        let raw_content = &*msg.content;
+        let content_value = match raw_content {
+            rmcp::model::RawContent::Text(text) => {
+                serde_json::json!(text.text)
+            }
+            rmcp::model::RawContent::Image(image) => {
+                serde_json::json!([{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.mime_type,
+                        "data": image.data
+                    }
+                }])
+            }
+            rmcp::model::RawContent::Resource(resource) => {
+                let res = &resource.resource;
+                match res {
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                        serde_json::json!(text)
+                    }
+                    rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
+                        serde_json::json!(format!("[Blob resource: {} bytes]", blob.len()))
+                    }
+                }
+            }
+            _ => serde_json::json!("[Unknown content type]"),
+        };
+        
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        
+        serde_json::json!({
+            "role": role,
+            "content": content_value
+        })
+    }).collect();
+    
+    // Build the request body (Anthropic format)
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": request.max_tokens,
+    });
+    
+    // Add optional parameters
+    if let Some(system) = &request.system_prompt {
+        body["system"] = Value::String(system.clone());
+    }
+    if let Some(temp) = request.temperature {
+        if let Some(num) = serde_json::Number::from_f64(temp as f64) {
+            body["temperature"] = Value::Number(num);
+        }
+    }
+    if let Some(stop) = &request.stop_sequences {
+        body["stop_sequences"] = Value::Array(stop.iter().map(|s| Value::String(s.clone())).collect());
+    }
+    
+    // If proxy server is running, use it for all requests (it handles routing to local/remote)
+    if let Some(port) = proxy_port {
+        let url = format!("http://127.0.0.1:{}/v1/messages", port);
+        log::info!("Using Jan proxy server on port {port} for MCP sampling");
+        return call_remote_llm_for_sampling(url, None, body, model).await;
+    }
+    
+    // Proxy not running - try direct access to remote providers or local sessions
+    log::debug!("Proxy server not running, trying direct access");
+    
+    // First check for remote providers (only active ones)
+    let (target_url, api_key) = {
+        let app_state = app_handle.state::<AppState>();
+        let provider_configs = app_state.provider_configs.lock().await;
+        
+        // Try to find an ACTIVE provider that has this model
+        let provider_entry = provider_configs.iter().find(|(_, config)| {
+            config.active && config.models.iter().any(|m| m == &model)
+        });
+        
+        if let Some((_, provider_cfg)) = provider_entry {
+            let base_url = provider_cfg.base_url.clone().unwrap_or_default();
+            let url = format!("{}{}", base_url.trim_end_matches('/'), "/messages");
+            (url, provider_cfg.api_key.clone())
+        } else {
+            // Check if model ID contains provider prefix (e.g., "anthropic/claude-3")
+            if let Some(sep_pos) = model.find('/') {
+                let provider_name = &model[..sep_pos];
+                if let Some(provider_cfg) = provider_configs.get(provider_name) {
+                    // Only use if active
+                    if provider_cfg.active {
+                        let base_url = provider_cfg.base_url.clone().unwrap_or_default();
+                        let url = format!("{}{}", base_url.trim_end_matches('/'), "/messages");
+                        (url, provider_cfg.api_key.clone())
+                    } else {
+                        // Provider is inactive, will try local
+                        (String::new(), None)
+                    }
+                } else {
+                    // No remote provider found, will try local
+                    (String::new(), None)
+                }
+            } else {
+                // No remote provider found, will try local
+                (String::new(), None)
+            }
+        }
+    };
+    
+    // If we have a remote provider URL, use it
+    if !target_url.is_empty() {
+        log::info!("Using remote provider for MCP sampling: {target_url}");
+        return call_remote_llm_for_sampling(target_url, api_key, body, model).await;
+    }
+    
+    // Try local llama.cpp or MLX sessions
+    // Get llama.cpp sessions
+    let llama_session_info = {
+        let llama_state: tauri::State<LlamacppState> = app_handle.state();
+        let sessions = llama_state.llama_server_process.lock().await;
+        sessions.values()
+            .find(|s| s.info.model_id == model)
+            .map(|s| (s.info.port, s.info.api_key.clone()))
+    };
+    
+    if let Some((port, session_api_key)) = llama_session_info {
+        let url = format!("http://127.0.0.1:{}/v1/messages", port);
+        log::info!("Using local llama.cpp session on port {port} for MCP sampling");
+        return call_remote_llm_for_sampling(url, Some(session_api_key), body, model).await;
+    }
+    
+    // Try MLX sessions
+    let mlx_session_info = {
+        let mlx_state: tauri::State<MlxState> = app_handle.state();
+        let sessions = mlx_state.mlx_server_process.lock().await;
+        sessions.values()
+            .find(|s| s.info.model_id == model)
+            .map(|s| (s.info.port, s.info.api_key.clone()))
+    };
+    
+    if let Some((port, session_api_key)) = mlx_session_info {
+        let url = format!("http://127.0.0.1:{}/v1/messages", port);
+        log::info!("Using local MLX session on port {port} for MCP sampling");
+        return call_remote_llm_for_sampling(url, Some(session_api_key), body, model).await;
+    }
+    
+    // No running session found for this model
+    log::error!("No running session found for model '{model}'");
+    Err(ErrorData::internal_error(
+        format!("No running session found for model '{model}'. Please start the model first."),
+        None,
+    ))
+}
+
+/// Helper function to call a remote or local LLM endpoint for sampling
+async fn call_remote_llm_for_sampling(
+    url: String,
+    api_key: Option<String>,
+    body: Value,
+    model: String,
+) -> Result<CreateMessageResult, ErrorData> {
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(120));
+    
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    
+    log::debug!("Sending sampling request to {url}");
+    
+    let response = req.send().await;
+    
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                log::error!("LLM sampling request failed with status {status}: {error_text}");
+                return Err(ErrorData::internal_error(
+                    format!("LLM request failed: {error_text}"),
+                    None,
+                ));
+            }
+            
+            // Parse the response
+            match resp.json::<Value>().await {
+                Ok(json_resp) => {
+                    // Log the full response for debugging
+                    log::debug!("LLM sampling response: {json_resp:#?}");
+                    
+                    // Try to extract content - handle both Anthropic and OpenAI formats
+                    let content_text = if let Some(content) = json_resp.get("content").and_then(|c| c.as_array()) {
+                        // Anthropic format: content[0].text
+                        content
+                            .first()
+                            .and_then(|block| block.get("text"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else if let Some(choices) = json_resp.get("choices").and_then(|c| c.as_array()) {
+                        // OpenAI format: choices[0].message.content
+                        choices
+                            .first()
+                            .and_then(|choice| choice.get("message"))
+                            .and_then(|msg| msg.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        log::warn!("LLM response has unexpected format, no content found");
+                        String::new()
+                    };
+                    
+                    let response_model = json_resp
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or(&model)
+                        .to_string();
+                    
+                    // Get stop_reason from either format
+                    let stop_reason = json_resp
+                        .get("stop_reason")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            // Try OpenAI format: choices[0].finish_reason
+                            json_resp
+                                .get("choices")
+                                .and_then(|c| c.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|choice| choice.get("finish_reason"))
+                                .and_then(|fr| fr.as_str())
+                                .map(|fr| match fr {
+                                    "stop" => "end_turn".to_string(),
+                                    "length" => "max_tokens".to_string(),
+                                    "tool_calls" => "tool_use".to_string(),
+                                    _ => fr.to_string(),
+                                })
+                        });
+                    
+                    // Log usage information if available (both formats)
+                    let usage = json_resp.get("usage");
+                    let input_tokens = usage
+                        .and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens")))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    let output_tokens = usage
+                        .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    
+                    log::info!(
+                        "LLM sampling completed: model={response_model}, stop_reason={stop_reason:?}, input_tokens={input_tokens}, output_tokens={output_tokens}, content_length={} chars",
+                        content_text.len()
+                    );
+                    log::debug!("LLM sampling result content: {content_text}");
+                    
+                    // Create the response
+                    let content = Content::text(content_text);
+                    let message = rmcp::model::SamplingMessage {
+                        role: Role::Assistant,
+                        content,
+                    };
+                    
+                    Ok(CreateMessageResult {
+                        message,
+                        model: response_model,
+                        stop_reason,
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to parse LLM response: {e}");
+                    Err(ErrorData::internal_error("Failed to parse LLM response", None))
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to call LLM for sampling: {e}");
+            Err(ErrorData::internal_error(
+                format!("Failed to call LLM: {e}"),
+                None,
+            ))
+        }
+    }
 }

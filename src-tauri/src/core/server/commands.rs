@@ -46,10 +46,17 @@ pub async fn start_server<R: Runtime>(
         api_key,
         vec![trusted_hosts],
         proxy_timeout,
-        app_handle,
+        app_handle.clone(),
     )
     .await
     .map_err(|e| e.to_string())?;
+    
+    // Store the port in AppState for MCP sampling
+    {
+        let mut proxy_port = state.proxy_port.lock().await;
+        *proxy_port = Some(actual_port);
+    }
+    
     Ok(actual_port)
 }
 

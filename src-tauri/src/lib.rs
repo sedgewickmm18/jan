@@ -111,6 +111,9 @@ pub fn run() {
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
         core::mcp::commands::respond_to_elicitation,
+        core::mcp::commands::respond_to_sampling,
+        core::mcp::commands::get_pending_samplings,
+        core::mcp::commands::set_active_model,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -192,6 +195,9 @@ pub fn run() {
         core::mcp::commands::deactivate_mcp_server,
         core::mcp::commands::check_jan_browser_extension_connected,
         core::mcp::commands::respond_to_elicitation,
+        core::mcp::commands::respond_to_sampling,
+        core::mcp::commands::get_pending_samplings,
+        core::mcp::commands::set_active_model,
         // Threads
         core::threads::commands::list_threads,
         core::threads::commands::create_thread,
@@ -211,6 +217,7 @@ pub fn run() {
 
     let app = app_builder
         .manage(AppState {
+            pending_samplings: Arc::new(Mutex::new(HashMap::new())),
             app_token: Some(generate_app_token()),
             mcp_servers: Arc::new(Mutex::new(HashMap::new())),
             download_manager: Arc::new(Mutex::new(DownloadManagerState::default())),
@@ -225,6 +232,8 @@ pub fn run() {
             provider_configs: Arc::new(Mutex::new(HashMap::new())),
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_successfully_connected: Arc::new(Mutex::new(HashMap::new())),
+            proxy_port: Arc::new(Mutex::new(None)),
+            active_model: Arc::new(Mutex::new(None)),
         })
         .setup(|app| {
             app.handle().plugin(

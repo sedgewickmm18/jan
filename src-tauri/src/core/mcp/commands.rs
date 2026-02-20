@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use super::{
     constants::DEFAULT_MCP_CONFIG,
-    helpers::{restart_active_mcp_servers, start_mcp_server, stop_mcp_servers_with_context, ShutdownContext},
-    models::{ElicitAction, ElicitRequest, ElicitResponse, PendingElicitation},
+    helpers::{restart_active_mcp_servers, start_mcp_server},
+    models::{ElicitAction, ElicitRequest, ElicitResponse, PendingElicitation, SamplingResponse, SamplingAction, SamplingMessage, SamplingContent},
 };
 use crate::core::{
     app::commands::get_jan_data_folder_path, mcp::models::McpSettings, state::AppState,
@@ -715,5 +715,161 @@ pub async fn handle_elicitation_request<R: Runtime>(
             })
         }
     }
+}
+
+// ============================================================================
+// MCP Sampling Support
+// ============================================================================
+
+/// Response to a sampling (createMessage) request from an MCP server
+/// 
+/// This command is called from the frontend after the LLM generates a response
+/// to a sampling request from an MCP server.
+/// 
+/// # Arguments
+/// * `state` - Application state containing pending samplings
+/// * `sampling_id` - The ID of the sampling request being responded to
+/// * `action` - The action: "accept" (provide response), "decline", or "cancel"
+/// * `message` - The generated message (only for "accept" action)
+/// * `model` - The model used for generation (only for "accept" action)
+/// * `stop_reason` - Why generation stopped (optional)
+#[tauri::command]
+pub async fn respond_to_sampling(
+    state: State<'_, AppState>,
+    sampling_id: String,
+    action: String,
+    message: Option<Value>,
+    model: Option<String>,
+    stop_reason: Option<String>,
+) -> Result<(), String> {
+    let mut pending = state.pending_samplings.lock().await;
+    
+    if let Some(pending_sampling) = pending.remove(&sampling_id) {
+        let result = match action.as_str() {
+            "accept" => {
+                // Parse the message from the provided value
+                let sampling_message = parse_sampling_message(message.ok_or("Message is required for accept action")?)?;
+                let model_name = model.ok_or("Model is required for accept action")?;
+                
+                Ok(SamplingResponse {
+                    message: sampling_message,
+                    model: model_name,
+                    stop_reason,
+                })
+            }
+            "decline" => Err(SamplingAction::Decline),
+            "cancel" => Err(SamplingAction::Cancel),
+            _ => return Err(format!("Invalid sampling action: {action}")),
+        };
+        
+        // Send the response back to the waiting handler
+        pending_sampling.response_tx.send(result)
+            .map_err(|_| "Failed to send sampling response - receiver dropped".to_string())?;
+        
+        log::info!("Sampling {sampling_id} responded with action: {action}");
+        Ok(())
+    } else {
+        Err(format!("Sampling request {sampling_id} not found or already responded"))
+    }
+}
+
+/// Parse a sampling message from a JSON value
+fn parse_sampling_message(value: Value) -> Result<SamplingMessage, String> {
+    let obj = value.as_object().ok_or("Message must be an object")?;
+    
+    let role = obj.get("role")
+        .and_then(|v| v.as_str())
+        .ok_or("Message must have a 'role' field")?
+        .to_string();
+    
+    let content_value = obj.get("content").ok_or("Message must have a 'content' field")?;
+    let content = parse_sampling_content(content_value)?;
+    
+    Ok(SamplingMessage { role, content })
+}
+
+/// Parse sampling content from a JSON value
+fn parse_sampling_content(value: &Value) -> Result<SamplingContent, String> {
+    let obj = value.as_object().ok_or("Content must be an object")?;
+    let content_type = obj.get("type")
+        .and_then(|v| v.as_str())
+        .ok_or("Content must have a 'type' field")?;
+    
+    match content_type {
+        "text" => {
+            let text = obj.get("text")
+                .and_then(|v| v.as_str())
+                .ok_or("Text content must have a 'text' field")?
+                .to_string();
+            Ok(SamplingContent::Text { text })
+        }
+        "image" => {
+            let data = obj.get("data")
+                .and_then(|v| v.as_str())
+                .ok_or("Image content must have a 'data' field")?
+                .to_string();
+            let mime_type = obj.get("mimeType")
+                .or_else(|| obj.get("mime_type"))
+                .and_then(|v| v.as_str())
+                .ok_or("Image content must have a 'mimeType' field")?
+                .to_string();
+            Ok(SamplingContent::Image { data, mime_type })
+        }
+        "resource" => {
+            let resource_obj = obj.get("resource")
+                .and_then(|v| v.as_object())
+                .ok_or("Resource content must have a 'resource' object")?;
+            let uri = resource_obj.get("uri")
+                .and_then(|v| v.as_str())
+                .ok_or("Resource must have a 'uri' field")?
+                .to_string();
+            let mime_type = resource_obj.get("mimeType")
+                .or_else(|| resource_obj.get("mime_type"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let text = resource_obj.get("text")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            
+            Ok(SamplingContent::Resource {
+                resource: crate::core::mcp::models::ResourceContent {
+                    uri,
+                    mime_type,
+                    text,
+                },
+            })
+        }
+        _ => Err(format!("Unknown content type: {content_type}")),
+    }
+}
+
+/// Get pending sampling requests (for debugging/UI purposes)
+#[tauri::command]
+pub async fn get_pending_samplings(
+    state: State<'_, AppState>,
+) -> Result<Vec<Value>, String> {
+    let pending = state.pending_samplings.lock().await;
+    let samplings: Vec<Value> = pending
+        .values()
+        .map(|p| {
+            serde_json::to_value(&p.request).unwrap_or_default()
+        })
+        .collect();
+    Ok(samplings)
+}
+
+/// Set the active model for MCP sampling requests
+/// 
+/// This command should be called from the frontend when the user selects a model.
+/// The active model is used when MCP servers request LLM sampling via createMessage.
+#[tauri::command]
+pub async fn set_active_model(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<(), String> {
+    let mut active_model = state.active_model.lock().await;
+    *active_model = Some(model_id.clone());
+    log::info!("Set active model for MCP sampling: {model_id}");
+    Ok(())
 }
 
