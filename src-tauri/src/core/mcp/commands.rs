@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolRequestParam, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{
     constants::DEFAULT_MCP_CONFIG,
     helpers::{restart_active_mcp_servers, start_mcp_server},
-    models::{ElicitAction, ElicitRequest, ElicitResponse, PendingElicitation, SamplingResponse, SamplingAction, SamplingMessage, SamplingContent},
+    models::{ElicitAction, ElicitRequest, ElicitResponse, ElicitSchema, PendingElicitation, SamplingResponse, SamplingAction, SamplingMessage, SamplingContent},
 };
 use crate::core::{
     app::commands::get_jan_data_folder_path, mcp::models::McpSettings, state::AppState,
@@ -270,9 +270,11 @@ pub async fn call_tool(
         println!("Found tool {tool_name} in server {srv_name}");
 
         // Call the tool with timeout and cancellation support
-        let tool_call = service.call_tool(CallToolRequestParam {
+        let tool_call = service.call_tool(CallToolRequestParams {
             name: tool_name.clone().into(),
             arguments,
+            meta: None,
+            task: None,
         });
 
         // Race between timeout, tool call, and cancellation
@@ -506,9 +508,11 @@ enum PingResult {
 async fn try_ping_tool(service: &RunningServiceEnum) -> PingResult {
     let result = timeout(
         Duration::from_secs(3),
-        service.call_tool(CallToolRequestParam {
+        service.call_tool(CallToolRequestParams {
             name: "ping".into(),
             arguments: Some(Map::new()),
+            meta: None,
+            task: None,
         }),
     )
     .await;
@@ -544,9 +548,11 @@ async fn try_browser_snapshot_tool(service: &RunningServiceEnum) -> Result<bool,
         // Snapshot tool is very time-consuming
         // Extend timeout to make sure the tool call has enough time to succeed
         Duration::from_secs(20),
-        service.call_tool(CallToolRequestParam {
+        service.call_tool(CallToolRequestParams {
             name: "browser_snapshot".into(),
             arguments: Some(Map::new()),
+            meta: None,
+            task: None,
         }),
     )
     .await;
@@ -667,6 +673,13 @@ pub async fn handle_elicitation_request<R: Runtime>(
 ) -> Result<ElicitResponse, String> {
     let elicitation_id = Uuid::new_v4().to_string();
     
+    // Parse the schema from JSON Value to ElicitSchema
+    let schema: ElicitSchema = serde_json::from_value(requested_schema.clone())
+        .unwrap_or_else(|e| {
+            log::warn!("Failed to parse elicitation schema, using raw value: {e}");
+            ElicitSchema::Raw(requested_schema.clone())
+        });
+    
     // Create response channel
     let (response_tx, response_rx) = oneshot::channel();
     
@@ -676,7 +689,7 @@ pub async fn handle_elicitation_request<R: Runtime>(
             id: elicitation_id.clone(),
             server: server_name.clone(),
             message: message.clone(),
-            requested_schema: requested_schema.clone(),
+            requested_schema: schema,
         },
         response_tx,
     };
@@ -687,7 +700,7 @@ pub async fn handle_elicitation_request<R: Runtime>(
         pending.insert(elicitation_id.clone(), pending_elicitation);
     }
     
-    // Emit event to frontend
+    // Emit event to frontend - serialize schema back to JSON for the event
     let event_payload = json!({
         "id": elicitation_id,
         "server": server_name,

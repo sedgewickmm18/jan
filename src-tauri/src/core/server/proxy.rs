@@ -407,6 +407,22 @@ fn transform_openai_response_to_anthropic(response: &serde_json::Value) -> serde
     })
 }
 
+/// Convert hyper::Method to reqwest::Method
+fn convert_method(method: &hyper::Method) -> reqwest::Method {
+    match *method {
+        hyper::Method::GET => reqwest::Method::GET,
+        hyper::Method::POST => reqwest::Method::POST,
+        hyper::Method::PUT => reqwest::Method::PUT,
+        hyper::Method::DELETE => reqwest::Method::DELETE,
+        hyper::Method::PATCH => reqwest::Method::PATCH,
+        hyper::Method::HEAD => reqwest::Method::HEAD,
+        hyper::Method::OPTIONS => reqwest::Method::OPTIONS,
+        hyper::Method::CONNECT => reqwest::Method::CONNECT,
+        hyper::Method::TRACE => reqwest::Method::TRACE,
+        _ => reqwest::Method::GET, // fallback
+    }
+}
+
 /// Configuration for the proxy server
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -1326,11 +1342,11 @@ async fn proxy_request<R: tauri::Runtime>(
         "Proxying request to model server at base URL {upstream_url}, path: {destination_path}"
     );
 
-    let mut outbound_req = client.request(method.clone(), upstream_url);
+    let mut outbound_req = client.request(convert_method(&method), upstream_url);
 
     for (name, value) in headers.iter() {
         if name != hyper::header::HOST && name != hyper::header::AUTHORIZATION {
-            outbound_req = outbound_req.header(name, value);
+            outbound_req = outbound_req.header(name.as_str(), value.as_bytes());
         }
     }
 
@@ -1415,11 +1431,11 @@ async fn proxy_request<R: tauri::Runtime>(
                     for (name, value) in headers.iter() {
                         if name != hyper::header::HOST
                             && name != hyper::header::AUTHORIZATION
-                            && name != "content-type"
-                            && name != hyper::header::CONTENT_LENGTH
-                            && name != hyper::header::ACCEPT_ENCODING
+                            && name.as_str() != "content-type"
+                            && name.as_str() != hyper::header::CONTENT_LENGTH.as_str()
+                            && name.as_str() != hyper::header::ACCEPT_ENCODING.as_str()
                         {
-                            fallback_req = fallback_req.header(name, value);
+                            fallback_req = fallback_req.header(name.as_str(), value.as_bytes());
                         }
                     }
                     if let Some(key) = fallback_api_key {
@@ -1438,7 +1454,7 @@ async fn proxy_request<R: tauri::Runtime>(
                             let fallback_error = res.text().await.unwrap_or_else(|e| format!("Failed to read error: {}", e));
 
                             // Return the error to client
-                            let mut error_response = Response::builder().status(fallback_status);
+                            let mut error_response = Response::builder().status(StatusCode::from_u16(fallback_status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
                             error_response = add_cors_headers_with_host_and_origin(
                                 error_response,
                                 &host_header,
@@ -1450,10 +1466,10 @@ async fn proxy_request<R: tauri::Runtime>(
                                 .unwrap());
                         }
 
-                        let mut builder = Response::builder().status(fallback_status);
+                        let mut builder = Response::builder().status(StatusCode::from_u16(fallback_status.as_u16()).unwrap_or(StatusCode::OK));
                         for (name, value) in res.headers() {
-                            if !is_cors_header(name.as_str()) && name != hyper::header::CONTENT_LENGTH {
-                                builder = builder.header(name, value);
+                            if !is_cors_header(name.as_str()) && name.as_str() != hyper::header::CONTENT_LENGTH.as_str() {
+                                builder = builder.header(name.as_str(), value.as_bytes());
                             }
                         }
                         builder = add_cors_headers_with_host_and_origin(
@@ -1493,7 +1509,7 @@ async fn proxy_request<R: tauri::Runtime>(
                 }
 
                 // If fallback failed or wasn't attempted, return error to client
-                let mut error_response = Response::builder().status(status);
+                let mut error_response = Response::builder().status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
                 error_response = add_cors_headers_with_host_and_origin(
                     error_response,
                     &host_header,
@@ -1508,7 +1524,7 @@ async fn proxy_request<R: tauri::Runtime>(
                     .await
                     .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
 
-                let mut error_response = Response::builder().status(status);
+                let mut error_response = Response::builder().status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
                 error_response = add_cors_headers_with_host_and_origin(
                     error_response,
                     &host_header,
@@ -1519,11 +1535,11 @@ async fn proxy_request<R: tauri::Runtime>(
             }
 
             // Success case - stream the response
-            let mut builder = Response::builder().status(status);
+            let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
 
             for (name, value) in response.headers() {
-                if !is_cors_header(name.as_str()) && name != hyper::header::CONTENT_LENGTH {
-                    builder = builder.header(name, value);
+                if !is_cors_header(name.as_str()) && name.as_str() != hyper::header::CONTENT_LENGTH.as_str() {
+                    builder = builder.header(name.as_str(), value.as_bytes());
                 }
             }
 

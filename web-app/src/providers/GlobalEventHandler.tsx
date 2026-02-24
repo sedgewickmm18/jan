@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useElicitationDialog } from '@/hooks/useElicitationDialog'
+import type { ElicitationSchema } from '@/types/events'
 
 /**
  * GlobalEventHandler handles global events that should be processed across all screens
@@ -25,7 +26,7 @@ export function GlobalEventHandler() {
           id: string
           server: string
           message: string
-          requestedSchema: Record<string, unknown>
+          requestedSchema: ElicitationSchema
         }>('mcp-elicitation', (event) => {
           console.log('Received mcp-elicitation event:', event.payload)
           

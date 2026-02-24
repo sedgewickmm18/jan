@@ -4,6 +4,205 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+// ============================================================================
+// MCP Elicitation Schema Types
+// ============================================================================
+
+/// Base schema properties common to all schema types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseSchema {
+    /// Human-readable title for the field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Description of what the field is for
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Default value for the field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
+
+/// String schema for elicitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StringSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // Always "string"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Minimum string length
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u32>,
+    /// Maximum string length
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u32>,
+    /// Regex pattern for validation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Format hint (e.g., "email", "uri", "date")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+/// Number/Integer schema for elicitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // "number" or "integer"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<f64>,
+    /// Minimum value (inclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    /// Maximum value (inclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+    /// Minimum value (exclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusive_minimum: Option<f64>,
+    /// Maximum value (exclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusive_maximum: Option<f64>,
+    /// Value must be a multiple of this number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiple_of: Option<f64>,
+}
+
+/// Boolean schema for elicitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BooleanSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // Always "boolean"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+}
+
+/// Single enum option for oneOf/anyOf
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumOption {
+    /// The constant value for this option
+    #[serde(rename = "const")]
+    pub const_value: Value,
+    /// Human-readable title for this option
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Description of this option
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Single-select enum schema using oneOf
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // "string", "number", "integer", or "boolean"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    /// Options using oneOf format (preferred)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub one_of: Option<Vec<EnumOption>>,
+    /// Simple enum values
+    #[serde(skip_serializing_if = "Option::is_none", rename = "enum")]
+    pub enum_values: Option<Vec<Value>>,
+}
+
+/// Multi-select enum schema (array with anyOf items)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSelectEnumSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // Always "array"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Vec<Value>>,
+    /// Minimum number of items to select
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u32>,
+    /// Maximum number of items to select
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+    /// The items schema containing anyOf options
+    pub items: MultiSelectItems,
+}
+
+/// Items schema for multi-select
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSelectItems {
+    /// The available options using anyOf format
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub any_of: Option<Vec<EnumOption>>,
+}
+
+/// Property schema for object properties
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PropertySchema {
+    String(StringSchema),
+    Number(NumberSchema),
+    Boolean(BooleanSchema),
+    Enum(EnumSchema),
+    MultiSelect(MultiSelectEnumSchema),
+    /// Raw JSON schema for unsupported types
+    Raw(Value),
+}
+
+/// Object schema with properties (traditional format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectSchema {
+    #[serde(rename = "type")]
+    pub type_: String, // Always "object"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Map of property name to schema
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Map<String, Value>>,
+    /// List of required property names
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+}
+
+/// Union type for all supported elicitation schemas
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ElicitSchema {
+    String(StringSchema),
+    Number(NumberSchema),
+    Boolean(BooleanSchema),
+    Enum(EnumSchema),
+    MultiSelect(MultiSelectEnumSchema),
+    Object(ObjectSchema),
+    /// Raw JSON schema for unsupported types
+    Raw(Value),
+}
+
 /// Elicitation request from an MCP server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,7 +214,7 @@ pub struct ElicitRequest {
     /// The message to display to the user
     pub message: String,
     /// The JSON schema describing the expected response
-    pub requested_schema: Value,
+    pub requested_schema: ElicitSchema,
 }
 
 /// Response to an elicitation request

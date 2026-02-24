@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::core::{downloads::models::DownloadManagerState, mcp::models::{McpSettings, PendingElicitation, PendingSampling}};
 use rmcp::{
-    model::{CallToolRequestParam, CallToolResult, InitializeRequestParam, Tool},
+    model::{CallToolRequestParams, CallToolResult, InitializeRequestParams, Tool},
     service::RunningService,
     RoleClient, ServiceError,
 };
@@ -38,7 +38,7 @@ pub type ElicitationService = RunningService<RoleClient, JanClientHandler>;
 
 pub enum RunningServiceEnum {
     NoInit(RunningService<RoleClient, ()>),
-    WithInit(RunningService<RoleClient, InitializeRequestParam>),
+    WithInit(RunningService<RoleClient, InitializeRequestParams>),
     /// HTTP client with custom elicitation handler
     WithElicitation(ElicitationService),
 }
@@ -81,7 +81,7 @@ impl RunningServiceEnum {
     }
     pub async fn call_tool(
         &self,
-        params: CallToolRequestParam,
+        params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
             Self::NoInit(s) => s.call_tool(params).await,

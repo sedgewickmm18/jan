@@ -1,14 +1,15 @@
 use rmcp::{
     handler::client::ClientHandler,
     model::{
-        ClientCapabilities, ClientInfo, CreateElicitationRequestParam,
+        ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
         CreateElicitationResult, ElicitationAction, ElicitationCapability, Implementation,
-        CreateMessageRequestParam, CreateMessageResult,
-        Role, Content, ErrorData,
+        CreateMessageRequestParams, CreateMessageResult,
+        Role, ErrorData, SamplingCapability, SamplingMessage, SamplingContent,
+        SamplingMessageContent,
     },
     service::RequestContext,
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, SseClientTransport,
+        streamable_http_client::StreamableHttpClientTransportConfig,
         StreamableHttpClientTransport, TokioChildProcess,
     },
     RoleClient, ServiceExt,
@@ -16,7 +17,7 @@ use rmcp::{
 use serde_json::Value;
 use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
-use tauri_plugin_http::reqwest;
+use reqwest;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -26,7 +27,7 @@ use tokio::{
 
 use crate::core::{
     app::commands::get_jan_data_folder_path,
-    mcp::models::{ElicitAction, ElicitRequest, McpServerConfig, McpSettings, PendingElicitation, PendingSampling},
+    mcp::models::{ElicitAction, ElicitRequest, ElicitSchema, McpServerConfig, McpSettings, PendingElicitation, PendingSampling},
     state::{AppState, RunningServiceEnum, SharedMcpServers},
 };
 use jan_utils::{can_override_npx, can_override_uvx};
@@ -65,7 +66,7 @@ impl ClientHandler for JanClientHandler {
             capabilities: ClientCapabilities {
                 elicitation: Some(ElicitationCapability::default()),
                 // Enable sampling capability
-                sampling: Some(serde_json::Map::new()),
+                sampling: Some(SamplingCapability::default()),
                 ..Default::default()
             },
             client_info: Implementation {
@@ -74,35 +75,71 @@ impl ClientHandler for JanClientHandler {
                 title: None,
                 website_url: None,
                 icons: None,
+                description: None,
             },
+            meta: Default::default(),
         }
     }
 
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParam,
+        request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateElicitationResult, ErrorData> {
-        // Generate unique ID for this elicitation
-        let elicitation_id = uuid::Uuid::new_v4().to_string();
+        // Handle both Form and URL elicitation variants
+        let (message, requested_schema, elicitation_id) = match &request {
+            CreateElicitationRequestParams::FormElicitationParams { message, requested_schema, .. } => {
+                // Generate unique ID for this form elicitation
+                let id = uuid::Uuid::new_v4().to_string();
+                (message.clone(), Some(requested_schema.clone()), id)
+            }
+            CreateElicitationRequestParams::UrlElicitationParams { message, url, elicitation_id, .. } => {
+                log::info!(
+                    "Received URL elicitation request from server {}: message={}, url={}, id={}",
+                    self.server_name, message, url, elicitation_id
+                );
+                // For URL elicitation, we open the URL in a browser
+                // For now, return decline as we don't support URL elicitation yet
+                return Ok(CreateElicitationResult {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                });
+            }
+        };
         
         log::info!(
             "Received elicitation request {} from server {}: {}",
             elicitation_id,
             self.server_name,
-            request.message
+            message
         );
+
+        // Log the full request parameters for debugging
+        log::debug!("Full elicitation request parameters: {:#?}", request);
         
         // Create response channel
         let (response_tx, response_rx) = oneshot::channel();
+        
+        // Parse the schema from the request
+        let schema: ElicitSchema = requested_schema
+            .as_ref()
+            .and_then(|s| serde_json::to_value(s).ok())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_else(|| {
+                log::warn!("Failed to parse elicitation schema, using raw value");
+                ElicitSchema::Raw(requested_schema
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(s).ok())
+                    .unwrap_or_default())
+            });
         
         // Create the pending elicitation
         let pending_elicitation = PendingElicitation {
             request: ElicitRequest {
                 id: elicitation_id.clone(),
                 server: self.server_name.clone(),
-                message: request.message.clone(),
-                requested_schema: serde_json::to_value(&request.requested_schema).unwrap_or_default(),
+                message: message.clone(),
+                requested_schema: schema,
             },
             response_tx,
         };
@@ -117,10 +154,11 @@ impl ClientHandler for JanClientHandler {
         let event_payload = serde_json::json!({
             "id": elicitation_id,
             "server": self.server_name,
-            "message": request.message,
-            "requestedSchema": request.requested_schema,
+            "message": message,
+            "requestedSchema": requested_schema,
         });
-        
+
+        log::debug!("Emitting elicitation event to frontend: {:#?}", event_payload);
         if let Err(e) = self.app_handle.emit("mcp-elicitation", event_payload) {
             log::error!("Failed to emit elicitation event: {e}");
             // Clean up and return cancel
@@ -171,7 +209,7 @@ impl ClientHandler for JanClientHandler {
 
     async fn create_message(
         &self,
-        request: CreateMessageRequestParam,
+        request: CreateMessageRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateMessageResult, ErrorData> {
         log::info!(
@@ -698,75 +736,12 @@ async fn schedule_mcp_start_task<R: Runtime>(
         let app_handle: tauri::AppHandle = unsafe { std::mem::transmute_copy(&app) };
         
         return start_http_mcp_server(app_handle, servers, name, config_params).await;
-    } else if config_params.transport_type.as_deref() == Some("sse") && config_params.url.is_some()
-    {
-        let transport = SseClientTransport::start_with_client(
-            reqwest::Client::builder()
-                .default_headers({
-                    // Map envs to request headers
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    for (key, value) in config_params.headers.iter() {
-                        if let Some(v_str) = value.as_str() {
-                            // Try to map env keys to HTTP header names (case-insensitive)
-                            // Most HTTP headers are Title-Case, so we try to convert
-                            let header_name =
-                                reqwest::header::HeaderName::from_bytes(key.as_bytes());
-                            if let Ok(header_name) = header_name {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(v_str)
-                                {
-                                    headers.insert(header_name, header_value);
-                                }
-                            }
-                        }
-                    }
-                    headers
-                })
-                .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
-                .build()
-                .unwrap(),
-            rmcp::transport::sse_client::SseClientConfig {
-                sse_endpoint: config_params.url.unwrap().into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| {
-            log::error!("transport error: {e:?}");
-            format!("Failed to start SSE transport: {e}")
-        })?;
-
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "Jan SSE Client".to_string(),
-                version: "0.0.1".to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-        };
-        let client = client_info.serve(transport).await.map_err(|e| {
-            log::error!("client error: {e:?}");
-            e.to_string()
-        });
-
-        match client {
-            Ok(client) => {
-                log::info!("Connected to server: {:?}", client.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::WithInit(client));
-
-                emit_mcp_update_event(&app, &name);
-            }
-            Err(e) => {
-                log::error!("Failed to connect to server: {e}");
-                return Err(format!("Failed to connect to server: {e}"));
-            }
-        }
+    } else if config_params.transport_type.as_deref() == Some("sse") {
+        // SSE transport is no longer supported in rmcp 0.16.0
+        // Use "http" transport type (streamable HTTP) instead
+        return Err(format!(
+            "SSE transport is no longer supported. Please change transport type from 'sse' to 'http' for MCP server '{name}'"
+        ));
     } else {
         if name == "Jan Browser MCP" {
             if let Some(port_str) = config_params.envs.get("BRIDGE_PORT") {
@@ -1384,7 +1359,7 @@ pub fn add_server_config_with_path<R: Runtime>(
 /// This function uses the proxy server if running, otherwise directly accesses the LLM backend.
 async fn call_llm_for_sampling(
     app_handle: &tauri::AppHandle,
-    request: CreateMessageRequestParam,
+    request: CreateMessageRequestParams,
 ) -> Result<CreateMessageResult, ErrorData> {
     use tauri_plugin_llamacpp::state::LlamacppState;
     use tauri_plugin_mlx::state::MlxState;
@@ -1474,38 +1449,27 @@ async fn call_llm_for_sampling(
     
     // Build the request body (Anthropic format)
     let messages: Vec<Value> = request.messages.iter().map(|msg| {
-        let raw_content = &*msg.content;
-        let content_value = match raw_content {
-            rmcp::model::RawContent::Text(text) => {
-                serde_json::json!(text.text)
+        // Handle SamplingContent enum (Single or Multiple)
+        let content_items: Vec<Value> = match &msg.content {
+            SamplingContent::Single(content) => {
+                vec![convert_sampling_message_content(content)]
             }
-            rmcp::model::RawContent::Image(image) => {
-                serde_json::json!([{
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": image.mime_type,
-                        "data": image.data
-                    }
-                }])
+            SamplingContent::Multiple(contents) => {
+                contents.iter().map(convert_sampling_message_content).collect()
             }
-            rmcp::model::RawContent::Resource(resource) => {
-                let res = &resource.resource;
-                match res {
-                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                        serde_json::json!(text)
-                    }
-                    rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
-                        serde_json::json!(format!("[Blob resource: {} bytes]", blob.len()))
-                    }
-                }
-            }
-            _ => serde_json::json!("[Unknown content type]"),
         };
         
         let role = match msg.role {
             Role::User => "user",
             Role::Assistant => "assistant",
+        };
+        
+        // For single text content, use simple string format
+        // For multiple or non-text content, use array format
+        let content_value = if content_items.len() == 1 {
+            content_items.into_iter().next().unwrap()
+        } else {
+            serde_json::json!(content_items)
         };
         
         serde_json::json!({
@@ -1628,6 +1592,51 @@ async fn call_llm_for_sampling(
     ))
 }
 
+/// Helper function to convert SamplingMessageContent to JSON value
+fn convert_sampling_message_content(content: &SamplingMessageContent) -> Value {
+    match content {
+        SamplingMessageContent::Text(text_content) => {
+            serde_json::json!(text_content.text)
+        }
+        SamplingMessageContent::Image(image_content) => {
+            serde_json::json!([{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_content.mime_type,
+                    "data": image_content.data
+                }
+            }])
+        }
+        SamplingMessageContent::Audio(audio_content) => {
+            serde_json::json!([{
+                "type": "audio",
+                "source": {
+                    "type": "base64",
+                    "media_type": audio_content.mime_type,
+                    "data": audio_content.data
+                }
+            }])
+        }
+        SamplingMessageContent::ToolUse(tool_use) => {
+            serde_json::json!([{
+                "type": "tool_use",
+                "id": tool_use.id,
+                "name": tool_use.name,
+                "input": tool_use.input
+            }])
+        }
+        SamplingMessageContent::ToolResult(tool_result) => {
+            serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": tool_result.tool_use_id,
+                "content": tool_result.content,
+                "is_error": tool_result.is_error
+            }])
+        }
+    }
+}
+
 /// Helper function to call a remote or local LLM endpoint for sampling
 async fn call_remote_llm_for_sampling(
     url: String,
@@ -1735,10 +1744,11 @@ async fn call_remote_llm_for_sampling(
                     log::debug!("LLM sampling result content: {content_text}");
                     
                     // Create the response
-                    let content = Content::text(content_text);
-                    let message = rmcp::model::SamplingMessage {
+                    let content = SamplingContent::Single(SamplingMessageContent::text(content_text));
+                    let message = SamplingMessage {
                         role: Role::Assistant,
                         content,
+                        meta: None,
                     };
                     
                     Ok(CreateMessageResult {

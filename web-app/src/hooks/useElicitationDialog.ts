@@ -1,12 +1,5 @@
 import { create } from 'zustand'
-import type { ElicitationAction } from '@/types/events'
-
-export type ElicitationRequest = {
-  id: string
-  server: string
-  message: string
-  requestedSchema: Record<string, unknown>
-}
+import type { ElicitationAction, ElicitationRequest } from '@/types/events'
 
 export type ElicitationModalProps = {
   request: ElicitationRequest
