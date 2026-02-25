@@ -397,23 +397,35 @@ export class CompletionMessagesBuilder {
  * @returns
  */
 export const parseReasoning = (text: string) => {
-  // Check for thinking formats
-  const hasThinkTag = text.includes('<think>') && !text.includes('</think>')
+  const OPEN_TAG = '<' + 'think>'
+  const CLOSE_TAG = '<' + '/think>'
+  
+  // Check for in-progress reasoning (opening tag without closing)
+  const hasOpenTag = text.includes(OPEN_TAG)
+  const hasCloseTag = text.includes(CLOSE_TAG)
+  
+  // Case: Has opening but no closing - reasoning in progress
+  if (hasOpenTag && !hasCloseTag) {
+    return { reasoningSegment: text, textSegment: '' }
+  }
+  
+  // Case: Has closing tag (with or without opening)
+  // Everything before and including the closing tag is reasoning
+  if (hasCloseTag) {
+    const closeIndex = text.indexOf(CLOSE_TAG) + CLOSE_TAG.length
+    return {
+      reasoningSegment: text.slice(0, closeIndex),
+      textSegment: text.slice(closeIndex),
+    }
+  }
+  
+  // Check for analysis channel format (alternative reasoning format)
   const hasAnalysisChannel =
     text.includes('<|channel|>analysis<|message|>') &&
     !text.includes('<|start|>assistant<|channel|>final<|message|>')
 
-  if (hasThinkTag || hasAnalysisChannel)
+  if (hasAnalysisChannel) {
     return { reasoningSegment: text, textSegment: '' }
-
-  // Check for completed think tag format
-  const thinkMatch = text.match(/<think>([\s\S]*?)<\/think>/)
-  if (thinkMatch?.index !== undefined) {
-    const splitIndex = thinkMatch.index + thinkMatch[0].length
-    return {
-      reasoningSegment: text.slice(0, splitIndex),
-      textSegment: text.slice(splitIndex),
-    }
   }
 
   // Check for completed analysis channel format

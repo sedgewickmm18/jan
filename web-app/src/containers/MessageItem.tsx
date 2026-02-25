@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { memo, useState, useCallback } from 'react'
+import { memo, useState, useCallback, useMemo } from 'react'
 import type { UIMessage, ChatStatus } from 'ai'
 import { RenderMarkdown } from './RenderMarkdown'
 import { cn } from '@/lib/utils'
@@ -23,7 +23,7 @@ import { EditMessageDialog } from '@/containers/dialogs/EditMessageDialog'
 import { DeleteMessageDialog } from '@/containers/dialogs/DeleteMessageDialog'
 import TokenSpeedIndicator from '@/containers/TokenSpeedIndicator'
 import { extractFilesFromPrompt, FileMetadata } from '@/lib/fileMetadata'
-import { useMemo } from 'react'
+import { parseReasoning } from '@/lib/messages'
 import { Button } from '@/components/ui/button'
 
 const CHAT_STATUS = {
@@ -145,49 +145,112 @@ export const MessageItem = memo(
         return null
       }
 
-      return (
-        <div key={`${message.id}-${partIndex}`} className="w-full">
-          {message.role === 'user' ? (
-            <div className="flex justify-end w-full h-full text-start wrap-break-word whitespace-normal">
-              <div className="bg-secondary relative text-foreground p-2 rounded-md inline-block max-w-[80%]">
-                {/* Show attached files if any */}
-                {attachedFiles.length > 0 && (
-                  <div className="flex flex-wrap gap-2 mb-3">
-                    {attachedFiles.map((file: FileMetadata, idx: number) => (
-                      <div
-                        key={`file-${idx}-${file.id}`}
-                        className="flex items-center gap-1.5 px-2 py-1 rounded-sm bg-secondary border text-xs"
-                      >
-                        <IconPaperclip
-                          size={14}
-                          className="text-muted-foreground"
-                        />
-                        <span className="font-medium">{file.name}</span>
-                        {file.injectionMode && (
-                          <span className="text-muted-foreground">
-                            ({file.injectionMode})
-                          </span>
-                        )}
-                      </div>
-                    ))}
+      // For assistant messages, check for think tags in the text
+      if (message.role === 'assistant') {
+        const { reasoningSegment, textSegment } = parseReasoning(part.text)
+        
+        // Extract reasoning text from think tags
+        // Handles three cases:
+        // 1. Full formattext
+        // 2. In-progress: text (everything before is reasoning)
+        let reasoningText: string | null = null
+        let isReasoningInProgress = false
+        
+        const OPEN_TAG = '<' + 'think>'
+        const CLOSE_TAG = '<' + '/think>'
+        
+        if (reasoningSegment) {
+          // Case 1 & 2: Has opening tag
+          if (reasoningSegment.includes(OPEN_TAG)) {
+            // Extract content after opening tag
+            const afterOpen = reasoningSegment.slice(reasoningSegment.indexOf(OPEN_TAG) + OPEN_TAG.length)
+            if (afterOpen.includes(CLOSE_TAG)) {
+              // Case 1: Completed - has both tags
+              reasoningText = afterOpen.slice(0, afterOpen.indexOf(CLOSE_TAG))
+            } else {
+              // Case 2: In-progress - no closing tag yet
+              reasoningText = afterOpen
+              isReasoningInProgress = true
+            }
+          } else if (reasoningSegment.includes(CLOSE_TAG)) {
+            // Case 3: Closing tag only - everything before it is reasoning
+            reasoningText = reasoningSegment.slice(0, reasoningSegment.indexOf(CLOSE_TAG))
+          }
+        }
+
+        return (
+          <div key={`${message.id}-${partIndex}`} className="w-full">
+            {/* Render reasoning in expandable section if present */}
+            {reasoningText && (
+              <Reasoning
+                className="w-full text-muted-foreground mb-4"
+                isStreaming={isStreaming && isLastPart && isReasoningInProgress}
+                defaultOpen={isStreaming && isLastPart && isReasoningInProgress}
+              >
+                <ReasoningTrigger />
+                <div className="relative">
+                  {isStreaming && isReasoningInProgress && (
+                    <div className="absolute top-0 left-0 right-0 h-8 bg-linear-to-br from-neutral-50 mask-t-from-98% dark:from-background to-transparent pointer-events-none z-10" />
+                  )}
+                  <div
+                    ref={isStreaming && isReasoningInProgress ? reasoningContainerRef : null}
+                    className={twMerge(
+                      'w-full overflow-auto relative',
+                      isStreaming && isReasoningInProgress
+                        ? 'max-h-32 opacity-70 mt-2 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
+                        : 'h-auto opacity-100'
+                    )}
+                  >
+                    <ReasoningContent>{reasoningText}</ReasoningContent>
                   </div>
-                )}
-                {displayText && (
-                  <div className="select-text whitespace-pre-wrap">
-                    {displayText}
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : (
-            <>
+                </div>
+              </Reasoning>
+            )}
+            {/* Render remaining text content */}
+            {textSegment && textSegment.trim() && (
               <RenderMarkdown
-                content={part.text}
-                isStreaming={isStreaming && isLastPart}
+                content={textSegment}
+                isStreaming={isStreaming && isLastPart && !isReasoningInProgress}
                 messageId={message.id}
               />
-            </>
-          )}
+            )}
+          </div>
+        )
+      }
+
+      return (
+        <div key={`${message.id}-${partIndex}`} className="w-full">
+          <div className="flex justify-end w-full h-full text-start wrap-break-word whitespace-normal">
+            <div className="bg-secondary relative text-foreground p-2 rounded-md inline-block max-w-[80%]">
+              {/* Show attached files if any */}
+              {attachedFiles.length > 0 && (
+                <div className="flex flex-wrap gap-2 mb-3">
+                  {attachedFiles.map((file: FileMetadata, idx: number) => (
+                    <div
+                      key={`file-${idx}-${file.id}`}
+                      className="flex items-center gap-1.5 px-2 py-1 rounded-sm bg-secondary border text-xs"
+                    >
+                      <IconPaperclip
+                        size={14}
+                        className="text-muted-foreground"
+                      />
+                      <span className="font-medium">{file.name}</span>
+                      {file.injectionMode && (
+                        <span className="text-muted-foreground">
+                          ({file.injectionMode})
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {displayText && (
+                <div className="select-text whitespace-pre-wrap">
+                  {displayText}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )
     }
