@@ -1268,11 +1268,33 @@ async fn proxy_request(
         "Proxying request to model server at base URL {upstream_url}, path: {destination_path}"
     );
 
-    let mut outbound_req = client.request(method.clone(), upstream_url);
+    // Convert hyper::Method to reqwest::Method
+    let reqwest_method = match method.as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        "CONNECT" => reqwest::Method::CONNECT,
+        "TRACE" => reqwest::Method::TRACE,
+        _ => return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::from("Method not allowed"))
+            .unwrap()),
+    };
+
+    let mut outbound_req = client.request(reqwest_method, upstream_url);
 
     for (name, value) in headers.iter() {
         if name != hyper::header::HOST && name != hyper::header::AUTHORIZATION {
-            outbound_req = outbound_req.header(name, value);
+            // Convert hyper header types to reqwest header types
+            let header_name = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                .expect("Invalid header name");
+            let header_value = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                .expect("Invalid header value");
+            outbound_req = outbound_req.header(header_name, header_value);
         }
     }
 
@@ -1361,7 +1383,12 @@ async fn proxy_request(
                             && name != hyper::header::CONTENT_LENGTH
                             && name != hyper::header::ACCEPT_ENCODING
                         {
-                            fallback_req = fallback_req.header(name, value);
+                            // Convert hyper header types to reqwest header types
+                            let header_name = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                                .expect("Invalid header name");
+                            let header_value = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                                .expect("Invalid header value");
+                            fallback_req = fallback_req.header(header_name, header_value);
                         }
                     }
                     if let Some(key) = fallback_api_key {
@@ -1379,8 +1406,12 @@ async fn proxy_request(
                             // Return fallback error to client
                             let fallback_error = res.text().await.unwrap_or_else(|e| format!("Failed to read error: {}", e));
 
+                            // Convert reqwest::StatusCode to hyper::StatusCode
+                            let hyper_fallback_error_status = hyper::StatusCode::from_u16(fallback_status.as_u16())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
                             // Return the error to client
-                            let mut error_response = Response::builder().status(fallback_status);
+                            let mut error_response = Response::builder().status(hyper_fallback_error_status);
                             error_response = add_cors_headers_with_host_and_origin(
                                 error_response,
                                 &host_header,
@@ -1392,10 +1423,20 @@ async fn proxy_request(
                                 .unwrap());
                         }
 
-                        let mut builder = Response::builder().status(fallback_status);
+                        // Convert reqwest::StatusCode to hyper::StatusCode
+                        let hyper_fallback_status = hyper::StatusCode::from_u16(fallback_status.as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let mut builder = Response::builder().status(hyper_fallback_status);
                         for (name, value) in res.headers() {
-                            if !is_cors_header(name.as_str()) && name != hyper::header::CONTENT_LENGTH {
-                                builder = builder.header(name, value);
+                            // Compare as strings to avoid type conflicts
+                            let name_str = name.as_str();
+                            if !is_cors_header(name_str) && name_str != "content-length" {
+                                // Convert reqwest header types to hyper header types
+                                let header_name = hyper::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                                    .expect("Invalid header name");
+                                let header_value = hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                                    .expect("Invalid header value");
+                                builder = builder.header(header_name, header_value);
                             }
                         }
                         builder = add_cors_headers_with_host_and_origin(
@@ -1435,7 +1476,10 @@ async fn proxy_request(
                 }
 
                 // If fallback failed or wasn't attempted, return error to client
-                let mut error_response = Response::builder().status(status);
+                // Convert reqwest::StatusCode to hyper::StatusCode
+                let hyper_error_status = hyper::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let mut error_response = Response::builder().status(hyper_error_status);
                 error_response = add_cors_headers_with_host_and_origin(
                     error_response,
                     &host_header,
@@ -1450,7 +1494,10 @@ async fn proxy_request(
                     .await
                     .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
 
-                let mut error_response = Response::builder().status(status);
+                // Convert reqwest::StatusCode to hyper::StatusCode
+                let hyper_status = hyper::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let mut error_response = Response::builder().status(hyper_status);
                 error_response = add_cors_headers_with_host_and_origin(
                     error_response,
                     &host_header,
@@ -1461,11 +1508,21 @@ async fn proxy_request(
             }
 
             // Success case - stream the response
-            let mut builder = Response::builder().status(status);
+            // Convert reqwest::StatusCode to hyper::StatusCode
+            let hyper_status = hyper::StatusCode::from_u16(status.as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = Response::builder().status(hyper_status);
 
             for (name, value) in response.headers() {
-                if !is_cors_header(name.as_str()) && name != hyper::header::CONTENT_LENGTH {
-                    builder = builder.header(name, value);
+                // Compare as strings to avoid type conflicts
+                let name_str = name.as_str();
+                if !is_cors_header(name_str) && name_str != "content-length" {
+                    // Convert reqwest header types to hyper header types
+                    let header_name = hyper::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                        .expect("Invalid header name");
+                    let header_value = hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                        .expect("Invalid header value");
+                    builder = builder.header(header_name, header_value);
                 }
             }
 

@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolRequestParam, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
@@ -264,9 +264,11 @@ pub async fn call_tool(
         println!("Found tool {tool_name} in server {srv_name}");
 
         // Call the tool with timeout and cancellation support
-        let tool_call = service.call_tool(CallToolRequestParam {
+        let tool_call = service.call_tool(CallToolRequestParams {
             name: tool_name.clone().into(),
             arguments,
+            meta: None,
+            task: None,
         });
 
         // Race between timeout, tool call, and cancellation
@@ -500,9 +502,11 @@ enum PingResult {
 async fn try_ping_tool(service: &RunningServiceEnum) -> PingResult {
     let result = timeout(
         Duration::from_secs(3),
-        service.call_tool(CallToolRequestParam {
+        service.call_tool(CallToolRequestParams {
             name: "ping".into(),
             arguments: Some(Map::new()),
+            meta: None,
+            task: None,
         }),
     )
     .await;
@@ -538,9 +542,11 @@ async fn try_browser_snapshot_tool(service: &RunningServiceEnum) -> Result<bool,
         // Snapshot tool is very time-consuming
         // Extend timeout to make sure the tool call has enough time to succeed
         Duration::from_secs(20),
-        service.call_tool(CallToolRequestParam {
+        service.call_tool(CallToolRequestParams {
             name: "browser_snapshot".into(),
             arguments: Some(Map::new()),
+            meta: None,
+            task: None,
         }),
     )
     .await;

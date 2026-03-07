@@ -1,15 +1,14 @@
 use rmcp::{
     model::{ClientCapabilities, ClientInfo, Implementation},
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, SseClientTransport,
-        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig},
+        TokioChildProcess,
     },
     ServiceExt,
 };
 use serde_json::Value;
 use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
-use tauri_plugin_http::reqwest;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -278,12 +277,16 @@ async fn schedule_mcp_start_task<R: Runtime>(
     let config_params = extract_command_args(&config)
         .ok_or_else(|| format!("Failed to extract command args from config for {name}"))?;
 
-    if config_params.transport_type.as_deref() == Some("http") && config_params.url.is_some() {
+    // Both "http" and "sse" transport types use StreamableHttpClientTransport in rmcp 0.17.0
+    if (config_params.transport_type.as_deref() == Some("http") 
+        || config_params.transport_type.as_deref() == Some("sse")) 
+        && config_params.url.is_some()
+    {
         let transport = StreamableHttpClientTransport::with_client(
             reqwest::Client::builder()
                 .default_headers({
                     // Map envs to request headers
-                    let mut headers: tauri::http::HeaderMap = reqwest::header::HeaderMap::new();
+                    let mut headers = reqwest::header::HeaderMap::new();
                     for (key, value) in config_params.headers.iter() {
                         if let Some(v_str) = value.as_str() {
                             // Try to map env keys to HTTP header names (case-insensitive)
@@ -314,84 +317,17 @@ async fn schedule_mcp_start_task<R: Runtime>(
             protocol_version: Default::default(),
             capabilities: ClientCapabilities::default(),
             client_info: Implementation {
-                name: "Jan Streamable Client".to_string(),
+                name: "Jan HTTP Client".to_string(),
                 version: "0.0.1".to_string(),
+                description: None,
                 title: None,
                 website_url: None,
                 icons: None,
             },
+            meta: None,
         };
         let client = client_info.serve(transport).await.inspect_err(|e| {
             log::error!("client error: {e:?}");
-        });
-
-        match client {
-            Ok(client) => {
-                log::info!("Connected to server: {:?}", client.peer_info());
-                servers
-                    .lock()
-                    .await
-                    .insert(name.clone(), RunningServiceEnum::WithInit(client));
-
-                emit_mcp_update_event(&app, &name);
-            }
-            Err(e) => {
-                log::error!("Failed to connect to server: {e}");
-                return Err(format!("Failed to connect to server: {e}"));
-            }
-        }
-    } else if config_params.transport_type.as_deref() == Some("sse") && config_params.url.is_some()
-    {
-        let transport = SseClientTransport::start_with_client(
-            reqwest::Client::builder()
-                .default_headers({
-                    // Map envs to request headers
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    for (key, value) in config_params.headers.iter() {
-                        if let Some(v_str) = value.as_str() {
-                            // Try to map env keys to HTTP header names (case-insensitive)
-                            // Most HTTP headers are Title-Case, so we try to convert
-                            let header_name =
-                                reqwest::header::HeaderName::from_bytes(key.as_bytes());
-                            if let Ok(header_name) = header_name {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(v_str)
-                                {
-                                    headers.insert(header_name, header_value);
-                                }
-                            }
-                        }
-                    }
-                    headers
-                })
-                .connect_timeout(config_params.timeout.unwrap_or(Duration::MAX))
-                .build()
-                .unwrap(),
-            rmcp::transport::sse_client::SseClientConfig {
-                sse_endpoint: config_params.url.unwrap().into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| {
-            log::error!("transport error: {e:?}");
-            format!("Failed to start SSE transport: {e}")
-        })?;
-
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "Jan SSE Client".to_string(),
-                version: "0.0.1".to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-        };
-        let client = client_info.serve(transport).await.map_err(|e| {
-            log::error!("client error: {e:?}");
-            e.to_string()
         });
 
         match client {
